@@ -29,7 +29,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "addpath"; Description: "Add Brinco to PATH"; GroupDescription: "Additional tasks:"; Flags: unchecked
 
 [Files]
-Source: "dist\windows-installer\brinco.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\windows-installer\brinco.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Brinco CLI"; Filename: "{app}\{#MyAppExeName}"
