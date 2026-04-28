@@ -84,16 +84,3 @@ scoops:
       name: brinco-bot
       email: actions@github.com
 
-chocolateys:
-  - name: brinco
-    disable: "{{ eq .Env.CHOCOLATEY_API_KEY \"\" }}"
-    title: brinco
-    authors: Yerlinson
-    project_url: https://github.com/yerlinson10/Brinco-CLI
-    url_template: "https://github.com/yerlinson10/Brinco-CLI/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
-    source_repo: "https://push.chocolatey.org/"
-    api_key: "{{ .Env.CHOCOLATEY_API_KEY }}"
-    description: |
-      Chat CLI P2P en Go con salas, codigos de invitacion y multiples modos de conexion.
-    summary: Chat CLI P2P en Go
-    release_notes: "https://github.com/yerlinson10/Brinco-CLI/releases/tag/{{ .Tag }}"

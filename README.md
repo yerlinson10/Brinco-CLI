@@ -66,10 +66,9 @@ brinco room join --name Luis --code CODIGO
 
 El proyecto ya incluye un pipeline de release que puede generar y publicar:
 1. Scoop
-2. Chocolatey
-3. deb y rpm
-4. Homebrew
-5. Instalador Windows .exe (Inno Setup)
+2. deb y rpm
+3. Homebrew
+4. Instalador Windows .exe (Inno Setup)
 
 ### Instalar por gestor (usuario final)
 
@@ -77,11 +76,6 @@ Scoop:
 ```powershell
 scoop bucket add brinco-bucket https://github.com/TU_USUARIO/scoop-bucket
 scoop install brinco
-```
-
-Chocolatey:
-```powershell
-choco install brinco
 ```
 
 Homebrew:
@@ -117,11 +111,10 @@ Variables de repositorio (Settings > Secrets and variables > Actions > Variables
 Secrets de repositorio (Settings > Secrets and variables > Actions > Secrets):
 1. HOMEBREW_TAP_GITHUB_TOKEN
 2. SCOOP_BUCKET_GITHUB_TOKEN
-3. CHOCOLATEY_API_KEY
 
 Notas:
 1. El workflow de release siempre sube binarios, checksums, deb/rpm e instalador .exe al Release actual.
-2. Homebrew/Scoop/Chocolatey se publican solo si sus variables y secrets estan configurados.
+2. Homebrew y Scoop se publican solo si sus variables y secrets estan configurados.
 
 ---
 

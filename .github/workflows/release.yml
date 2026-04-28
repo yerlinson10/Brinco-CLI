@@ -12,6 +12,7 @@ jobs:
   goreleaser:
     name: Build and publish packages
     runs-on: ubuntu-latest
+    environment: main
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +39,6 @@ jobs:
           SCOOP_BUCKET_OWNER: ${{ vars.SCOOP_BUCKET_OWNER }}
           SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
-          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
 
       - name: Run GoReleaser snapshot (manual)
         if: github.event_name != 'release'
