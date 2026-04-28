@@ -55,7 +55,6 @@ nfpms:
 
 brews:
   - name: brinco
-    disable: "{{ or (eq .Env.HOMEBREW_TAP_OWNER \"\") (or (eq .Env.HOMEBREW_TAP_REPO \"\") (eq .Env.HOMEBREW_TAP_GITHUB_TOKEN \"\")) }}"
     repository:
       owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
       name: "{{ .Env.HOMEBREW_TAP_REPO }}"
@@ -72,7 +71,6 @@ brews:
 
 scoops:
   - name: brinco
-    disable: "{{ or (eq .Env.SCOOP_BUCKET_OWNER \"\") (or (eq .Env.SCOOP_BUCKET_REPO \"\") (eq .Env.SCOOP_BUCKET_GITHUB_TOKEN \"\")) }}"
     repository:
       owner: "{{ .Env.SCOOP_BUCKET_OWNER }}"
       name: "{{ .Env.SCOOP_BUCKET_REPO }}"
