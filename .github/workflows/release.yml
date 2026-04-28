@@ -79,11 +79,19 @@ jobs:
         env:
           BRINCO_VERSION: ${{ github.ref_name }}
 
+      - name: List installer outputs
+        shell: powershell
+        run: |
+          Write-Host "Listing installer outputs..."
+          if (Test-Path "packaging/windows/Output") { Get-ChildItem -Recurse "packaging/windows/Output" }
+          if (Test-Path "Output") { Get-ChildItem -Recurse "Output" }
+
       - name: Upload installer to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            packaging/windows/Output/Brinco-Setup-*.exe
             Output/Brinco-Setup-*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -93,4 +101,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: brinco-windows-installer
-          path: Output/Brinco-Setup-*.exe
+          path: |
+            packaging/windows/Output/Brinco-Setup-*.exe
+            Output/Brinco-Setup-*.exe
