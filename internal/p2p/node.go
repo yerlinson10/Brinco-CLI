@@ -14,6 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"brinco-cli/internal/logx"
+	"brinco-cli/internal/roomproto"
+
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -61,9 +64,55 @@ type Node struct {
 	seenMsgs map[string]time.Time
 }
 
+// NewNodeGuaranteed crea un nodo libp2p que usa los bootstrap publicos de IPFS
+// como candidatos de relay automatico. No requiere configurar ningun relay manual.
+func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, error) {
+	retx, cancel := context.WithCancel(ctx)
+	logx.Debug("p2p guaranteed node init")
+
+	// Bootstrap IPFS + extras del usuario como candidatos de relay estatico.
+	// Los nodos de bootstrap de la red IPFS soportan circuit relay v2.
+	allRelays := append(append([]string(nil), defaultBootstrapPeers...), extraRelayAddrs...)
+
+	opts := []libp2p.Option{
+		libp2p.NoTransports,
+		libp2p.Transport(libp2ptcp.NewTCPTransport),
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip6/::/tcp/0",
+		),
+		libp2p.EnableNATService(),
+		libp2p.NATPortMap(),
+		libp2p.EnableRelay(),
+		libp2p.EnableAutoRelayWithStaticRelays(peerInfosFromAddrs(allRelays)),
+		libp2p.EnableHolePunching(),
+	}
+
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("error creando nodo: %w", err)
+	}
+
+	ps, err := pubsub.NewGossipSub(
+		retx,
+		h,
+		pubsub.WithPeerExchange(true),
+		pubsub.WithFloodPublish(true),
+	)
+	if err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, fmt.Errorf("error creando pubsub: %w", err)
+	}
+
+	return &Node{host: h, ps: ps, ctx: retx, cancel: cancel, seenMsgs: make(map[string]time.Time)}, nil
+}
+
 // NewNode crea un nodo libp2p con relay circuit habilitado
 func NewNode(ctx context.Context, relayAddrs []string) (*Node, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	logx.Debug("p2p node init", "relays", len(relayAddrs))
 
 	opts := []libp2p.Option{
 		// En Windows evitamos QUIC por un panic conocido de quic-go en algunos entornos.
@@ -189,27 +238,39 @@ func (n *Node) ID() string {
 
 // BuildRoomCode genera un codigo de sala a partir del topic (y relay opcional)
 func BuildRoomCode(topic, relayAddr string, peers []string) (string, error) {
+	return BuildRoomCodeWithProtocol(topic, relayAddr, peers, roomproto.ProtocolP2P)
+}
+
+// BuildRoomCodeWithProtocol genera un codigo de sala con el prefijo de protocolo indicado.
+func BuildRoomCodeWithProtocol(topic, relayAddr string, peers []string, protocol string) (string, error) {
 	payload := roomCodePayload{Topic: topic, Relay: relayAddr, Peers: peers}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
+	return roomproto.Wrap(protocol, base64.RawURLEncoding.EncodeToString(raw)), nil
 }
 
 func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(code))
+	protocol, encoded := roomproto.Unwrap(code)
+	if protocol != "" && protocol != roomproto.ProtocolP2P && protocol != roomproto.ProtocolGuaranteed {
+		return roomCodePayload{}, fmt.Errorf("codigo no es p2p")
+	}
+	if encoded == "" {
+		encoded = strings.TrimSpace(code)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return roomCodePayload{}, err
 	}
-	var payload roomCodePayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	var rc roomCodePayload
+	if err := json.Unmarshal(raw, &rc); err != nil {
 		return roomCodePayload{}, err
 	}
-	if payload.Topic == "" {
+	if rc.Topic == "" {
 		return roomCodePayload{}, fmt.Errorf("codigo invalido")
 	}
-	return payload, nil
+	return rc, nil
 }
 
 // ParseRoomCode descodifica un codigo de sala

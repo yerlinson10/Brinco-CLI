@@ -2,281 +2,251 @@
 
 Chat de consola en Go con salas, codigo de invitacion y nombres coloreados por usuario.
 
-La aplicacion soporta tres formas de conexion:
+## 1) Que trae esta version
 
-1. Modo P2P con libp2p (modo por defecto, recomendado para comunidad, sin servidor obligatorio).
-2. Modo directo TCP (sin libp2p, requiere exponer puertos).
-3. Modo relay propio TCP (opcional, para mayor control en internet).
+1. Modos de conexion:
+	- p2p
+	- direct
+	- relay
+	- guaranteed (relay-first)
+2. Codigos de sala con prefijo de protocolo:
+	- p2p-...
+	- direct-...
+	- relay-...
+	- guaranteed-...
+3. Join en modo auto segun prefijo de codigo.
+4. Sistema de logs persistente con nivel configurable.
 
-## 1) Requisitos
+## 2) Requisitos
 
 1. Go 1.22 o superior.
-2. Terminal con salida ANSI para ver colores (opcional).
-3. Conexion a internet para modo P2P/libp2p.
+2. Terminal con soporte ANSI para colores (opcional).
+3. Internet para modo p2p y relay en redes distintas.
 
-## 2) Estructura del proyecto
+## 3) Estructura relevante
 
-- cmd/brinco/main.go
-	Punto de entrada.
+1. cmd/brinco/main.go
+	- punto de entrada
+2. internal/cli/cli.go
+	- comandos, flags y seleccion de modo
+3. internal/p2p/node.go
+	- nodo libp2p y chat p2p
+4. internal/p2p/commands.go
+	- create/join p2p
+5. internal/chat/chat.go
+	- chat TCP directo y parseo de codigos direct/relay/guaranteed
+6. internal/chat/relay.go
+	- servidor relay TCP y cliente relay
+7. internal/roomproto/roomproto.go
+	- prefijo y parseo de protocolo en codigos de sala
+8. internal/logx/logx.go
+	- logs a archivo y niveles
 
-- internal/cli/cli.go
-	Parser de comandos y flags.
+## 4) Instalacion rapida
 
-- internal/p2p/node.go
-	Nodo libp2p, pubsub y descubrimiento.
-
-- internal/p2p/commands.go
-	Flujos create y join en modo P2P.
-
-- internal/chat/chat.go
-	Motor de chat TCP directo.
-
-- internal/chat/relay.go
-	Relay TCP propio y clientes relay.
-
-## 3) Instalacion y arranque
-
-Desde la raiz del proyecto:
-
+```bash
 go mod tidy
 go run ./cmd/brinco --help
+```
 
-## 4) Comandos principales
+## 5) Comandos principales
 
-Comandos globales:
-
-- go run ./cmd/brinco help
-- go run ./cmd/brinco version
-- go run ./cmd/brinco room help
-- go run ./cmd/brinco relay help
-
-Comandos de sala:
-
-- go run ./cmd/brinco room create --name Ana
-- go run ./cmd/brinco room join --name Luis --code CODIGO
-- go run ./cmd/brinco room code
-
-Comando de relay propio:
-
-- go run ./cmd/brinco relay serve --listen 0.0.0.0:10000 --public IP_PUBLICA:10000
-
-## 5) Modos de uso detallados
-
-### 5.1 Modo P2P (recomendado)
-
-Este es el modo por defecto. No necesita que el host abra puertos manualmente en la mayoria de escenarios.
-
-Crear sala:
+```bash
+go run ./cmd/brinco help
+go run ./cmd/brinco version
+go run ./cmd/brinco room help
+go run ./cmd/brinco relay help
 
 go run ./cmd/brinco room create --name Ana
+go run ./cmd/brinco room join --name Luis --code CODIGO
+go run ./cmd/brinco room code
 
-Unirse desde otro equipo:
+go run ./cmd/brinco relay serve --listen 0.0.0.0:10000 --public IP_PUBLICA:10000
+```
 
-go run ./cmd/brinco room join --name Luis --code CODIGO_GENERADO
+## 6) Modos de sala
 
-Opcional con relay libp2p propio:
+| Modo | Protocolo codigo | Requiere relay manual | Cuando usar |
+|-----------|------------------|----------------------|-------------------------------------------------------|
+| p2p | p2p-... | No | Conexion directa o relay automatico libp2p |
+| guaranteed| guaranteed-... | No | NAT estricto, VM, firewalls. Relay IPFS automatico |
+| relay | relay-... | Si (TCP propio) | Relay TCP propio con control total |
+| direct | direct-... | Si (IP publica) | Ambos lados tienen IP/puerto accesible |
+### 6.1 p2p (default)
 
-go run ./cmd/brinco room create --name Ana --relay /ip4/IP/tcp/PUERTO/p2p/PEER_ID
-go run ./cmd/brinco room join --name Luis --code CODIGO_GENERADO --relay /ip4/IP/tcp/PUERTO/p2p/PEER_ID
+```bash
+go run ./cmd/brinco room create --mode p2p --name Ana
+go run ./cmd/brinco room join --mode p2p --name Luis --code p2p-...
+```
 
-### 5.2 Modo directo TCP
+Tambien puedes usar relay libp2p opcional:
 
-Usa la bandera --direct. Requiere que el host sea alcanzable desde internet o LAN.
+```bash
+go run ./cmd/brinco room create --mode p2p --name Ana --relay /ip4/IP/tcp/PUERTO/p2p/PEER_ID
+go run ./cmd/brinco room join --mode p2p --name Luis --code p2p-... --relay /ip4/IP/tcp/PUERTO/p2p/PEER_ID
+```
 
-Crear sala directa:
+### 6.2 direct (TCP puro)
 
-go run ./cmd/brinco room create --direct --name Ana --listen 0.0.0.0:9090 --public TU_IP_PUBLICA:9090 --password clave123
+```bash
+go run ./cmd/brinco room create --mode direct --name Ana --listen 0.0.0.0:9090 --public TU_IP_PUBLICA:9090 --password clave123
+go run ./cmd/brinco room join --mode direct --name Luis --code direct-... --password clave123
+```
 
-Unirse en directo:
+Atajo legacy equivalente:
 
-go run ./cmd/brinco room join --direct --name Luis --code CODIGO_GENERADO --password clave123
+```bash
+go run ./cmd/brinco room create --direct ...
+go run ./cmd/brinco room join --direct ...
+```
 
-### 5.3 Modo relay propio TCP
+### 6.3 relay (TCP relay dedicado)
 
-Primero levantas tu relay:
-
+```bash
 go run ./cmd/brinco relay serve --listen 0.0.0.0:10000 --public TU_IP_PUBLICA:10000
+go run ./cmd/brinco room create --mode relay --name Ana --relay TU_IP_PUBLICA:10000 --password clave123
+go run ./cmd/brinco room join --mode relay --name Luis --code relay-... --password clave123
+```
 
-Luego creas sala en directo usando relay TCP:
+### 6.4 guaranteed (relay libp2p automatico)
 
-go run ./cmd/brinco room create --direct --name Ana --relay TU_IP_PUBLICA:10000 --password clave123
+Este modo usa la red IPFS/libp2p para descubrir relays automaticamente.
+**No requiere configurar ningun relay manual.** Es la opcion recomendada cuando p2p
+no logra conectar por NAT estricto, VMs o firewalls.
 
-Y el cliente se une en directo:
+```bash
+# Crear sala (no se necesita --relay)
+go run ./cmd/brinco room create --mode guaranteed --name Ana
 
-go run ./cmd/brinco room join --direct --name Luis --code CODIGO_GENERADO --password clave123
+# Unirse
+go run ./cmd/brinco room join --mode guaranteed --name Luis --code guaranteed-...
+```
 
-## 6) Comandos dentro del chat
+Diferencias con p2p:
+- Registra los nodos bootstrap de IPFS como candidatos de relay estatico.
+- Libp2p negocia automaticamente circuitos relay con esos nodos.
+- Mas robusto en redes restrictivas sin necesidad de infraestructura propia.
 
-Comandos interactivos:
+## 7) Join automatico por protocolo
 
-- /code
-	Muestra el codigo de la sala actual.
+Si no quieres pensar en modo, usa auto:
 
-- /help
-	Muestra ayuda de comandos interactivos.
+```bash
+go run ./cmd/brinco room join --mode auto --name Luis --code CODIGO
+```
 
-- /quit
-	Sale del chat.
+Regla:
+1. Si el codigo tiene prefijo conocido, usa ese protocolo.
+2. Si no tiene prefijo, cae en p2p por compatibilidad.
 
-Nota:
-En modo directo TCP existen ademas respuestas de peers en el protocolo interno; en la UI actual la ayuda visible es /code, /help y /quit.
+## 8) Comandos dentro del chat
 
-## 7) Flujo recomendado para pruebas
+```text
+/code   Muestra el codigo de sala
+/peers  Muestra peers enlazados (p2p)
+/quit   Salir
+/help   Ayuda
+```
 
-### Prueba local rapida (mismo PC, dos terminales)
+## 9) Logging
+
+Ruta de log:
+1. Se guarda en cache de usuario.
+2. Nombre: brinco.log.
+
+Ejemplo de ubicacion:
+1. Windows: %LOCALAPPDATA%\brinco-cli\logs\brinco.log
+2. Linux/macOS: ~/.cache/brinco-cli/logs/brinco.log
+
+Nivel de log:
+
+```bash
+# PowerShell
+$env:BRINCO_LOG_LEVEL="debug"
+
+# Bash
+export BRINCO_LOG_LEVEL=debug
+```
+
+Valores validos: debug, info, warn, error.
+
+## 10) Pruebas recomendadas
+
+### 10.1 Basica local (2 terminales)
 
 1. Terminal A:
-	 go run ./cmd/brinco room create --name Ana
-
-2. Copiar codigo de sala.
-
+```bash
+go run ./cmd/brinco room create --mode p2p --name Ana
+```
+2. Copiar codigo.
 3. Terminal B:
-	 go run ./cmd/brinco room join --name Luis --code CODIGO
+```bash
+go run ./cmd/brinco room join --mode auto --name Luis --code CODIGO
+```
+4. Probar envio bidireccional y /peers.
 
-4. Enviar mensajes desde ambos lados y verificar colores por nombre.
+### 10.2 Entre redes distintas (estable)
 
-### Prueba en dos redes distintas
+Si p2p no enruta por NAT/VM, usa guaranteed. No necesitas relay propio:
 
-1. Crear sala en equipo 1:
-	 go run ./cmd/brinco room create --name Ana
+```bash
+# Terminal A
+go run ./cmd/brinco room create --mode guaranteed --name Ana
 
-2. Compartir codigo con equipo 2.
+# Copiar el codigo guaranteed-...
 
-3. Unirse en equipo 2:
-	 go run ./cmd/brinco room join --name Luis --code CODIGO
+# Terminal B (otra red, VM, etc.)
+go run ./cmd/brinco room join --mode auto --name Luis --code guaranteed-...
+```
 
-Si no conecta, revisar la seccion de errores comunes.
+Libp2p descubrira relay disponibles en la red IPFS automaticamente.
 
-## 8) Errores comunes y solucion
+## 11) Errores comunes y solucion
 
-### Error: go no se reconoce como comando
+### 11.1 go no se reconoce
 
-Sintoma:
-- El terminal muestra que go no existe o no se reconoce.
-
-Causa:
-- Go no esta instalado o no esta en PATH.
-
-Solucion:
 1. Instalar Go 1.22+.
-2. Cerrar y abrir la terminal.
-3. Verificar con: go version.
+2. Cerrar y abrir terminal.
+3. Verificar con go version.
 
-### Error: Error parseando codigo
+### 11.2 Error parseando codigo
 
-Sintoma:
-- Al hacer join, falla al parsear el codigo.
+1. Revisa que no haya espacios o cortes al copiar.
+2. Usa el codigo completo con su prefijo.
+3. Si el codigo es de modo relay/direct/guaranteed, no fuerces mode p2p.
 
-Causa:
-- Codigo copiado incompleto o con espacios extra.
+### 11.3 no hay codigo guardado
 
-Solucion:
-1. Copiar el codigo completo de una sola linea.
-2. Evitar comillas adicionales.
-3. Probar room code en el host para recuperar el ultimo codigo.
+1. Debes crear una sala antes de room code.
+2. Si limpiaste cache, se pierde el ultimo codigo local.
 
-### Error: no hay codigo guardado
+### 11.4 no hay peers conectados en la sala
 
-Sintoma:
-- room code devuelve que no hay codigo guardado.
+1. En p2p esto suele ser problema de ruta NAT/firewall.
+2. Prueba /peers para confirmar.
+3. Usa mode guaranteed para conectividad consistente.
 
-Causa:
-- No se ha creado sala en esa maquina o se limpio cache de usuario.
+### 11.5 password incorrecta
 
-Solucion:
-1. Crear una sala nueva.
-2. Confirmar que aparezca Codigo de sala en pantalla.
+1. Aplica a direct/relay/guaranteed.
+2. Debe ser exactamente la misma clave del host.
 
-### Error: no se pudo unir al topic / no conecta en P2P
+### 11.6 relay no disponible
 
-Sintoma:
-- La app inicia pero no logra comunicacion estable.
+1. Verifica IP/puerto y firewall del relay.
+2. Confirma que relay serve siga corriendo.
 
-Causa:
-- Red muy restringida, proxy corporativo, bloqueo de puertos salientes o NAT estricto.
+### 11.7 no veo colores
 
-Solucion:
-1. Probar desde otra red (por ejemplo datos moviles).
-2. Probar con relay libp2p propio en --relay.
-3. Si sigue fallando, usar modo --direct con relay TCP propio.
+1. Prueba otra terminal con ANSI.
+2. Revisa si NO_COLOR esta definida.
 
-### Error: dial tcp ... actively refused
+## 12) Compilar
 
-Sintoma:
-- Conexion rechazada al puerto remoto.
-
-Causa:
-- No hay servicio escuchando en ese puerto, firewall bloquea o IP incorrecta.
-
-Solucion:
-1. Verificar que el proceso este corriendo en host.
-2. Revisar firewall del host.
-3. Revisar direccion y puerto exactos.
-4. Si es internet, validar NAT/port forwarding en modo directo.
-
-### Error: password incorrecta
-
-Sintoma:
-- Al unirse en modo directo/relay TCP, el servidor rechaza credenciales.
-
-Causa:
-- Password distinta a la usada al crear sala.
-
-Solucion:
-1. Repetir join con la misma password del creador.
-2. Evitar espacios al final.
-
-### Error: relay no disponible
-
-Sintoma:
-- Advertencia al reservar circuito o conectar relay.
-
-Causa:
-- Multiaddr invalida, relay caido o inaccesible.
-
-Solucion:
-1. Validar formato multiaddr:
-	 /ip4/IP/tcp/PUERTO/p2p/PEER_ID
-2. Verificar que relay este encendido.
-3. Probar sin --relay para usar red publica.
-
-### Error: Cloud Shell conecta mal o se queda colgado
-
-Sintoma:
-- Desde entornos tipo shell web no llega conexion estable en modos TCP.
-
-Causa:
-- Restricciones de puertos entrantes/salientes del entorno.
-
-Solucion:
-1. Usar modo P2P por defecto.
-2. Si usas relay TCP, ejecutarlo en VM con puertos abiertos reales.
-
-### No veo colores en consola
-
-Sintoma:
-- Los nombres salen sin color.
-
-Causa:
-- Terminal sin soporte ANSI o variable NO_COLOR activa.
-
-Solucion:
-1. Probar otra terminal (Windows Terminal, PowerShell moderno).
-2. Revisar variable NO_COLOR y desactivarla si aplica.
-
-## 9) Buenas practicas operativas
-
-1. Para comunidad, prioriza modo P2P por defecto.
-2. Usa relay propio solo cuando necesites control o debugging.
-3. Si publicas un relay, monitorea disponibilidad y limita abuso.
-4. Versiona cambios de protocolo si vas a extender mensajes.
-
-## 10) Compilar binario
-
-Windows:
-
+```bash
+# Windows
 go build -o bin/brinco.exe ./cmd/brinco
 
-Linux/macOS:
-
+# Linux/macOS
 go build -o bin/brinco ./cmd/brinco
+```

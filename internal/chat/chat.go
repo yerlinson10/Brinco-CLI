@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"brinco-cli/internal/logx"
+	"brinco-cli/internal/roomproto"
 )
 
 const (
@@ -30,8 +33,9 @@ const (
 	msgTypePeers    = "peers"
 	msgTypeQuit     = "quit"
 
-	roomModeDirect = "direct"
-	roomModeRelay  = "relay"
+	roomModeDirect     = "direct"
+	roomModeRelay      = "relay"
+	roomModeGuaranteed = "guaranteed"
 
 	lastRoomCodeFile = "brinco-last-room-code.txt"
 )
@@ -71,6 +75,7 @@ type roomServer struct {
 }
 
 func RunCreate(name, listenAddr, publicAddr, password string) int {
+	logx.Info("chat create start", "mode", roomModeDirect, "listen", listenAddr)
 	if strings.TrimSpace(password) == "" {
 		fmt.Fprintln(os.Stderr, "Error: --password es obligatorio para crear sala")
 		return 1
@@ -112,12 +117,14 @@ func RunCreate(name, listenAddr, publicAddr, password string) int {
 	fmt.Println("Sala creada")
 	fmt.Printf("Codigo de sala: %s\n", code)
 	fmt.Println("Comparte este codigo con tus peers")
+	logx.Info("chat sala creada", "mode", roomModeDirect, "room", roomID)
 
 	dialAddr := dialAddrForHost(listenAddr)
 	return runClient(dialAddr, roomID, name, password, code)
 }
 
 func RunJoin(name, code, password string) int {
+	logx.Info("chat join start")
 	if strings.TrimSpace(code) == "" {
 		fmt.Fprintln(os.Stderr, "Error: --code es obligatorio")
 		return 1
@@ -141,14 +148,14 @@ func RunJoin(name, code, password string) int {
 		addr = payload.Relay
 	}
 	roomID := payload.Room
-	mode := payload.Mode
+	mode := strings.TrimSpace(payload.Mode)
 	if mode == "" {
 		mode = roomModeDirect
 	}
 
 	fmt.Printf("Conectando a %s...\n", addr)
-	if mode == roomModeRelay {
-		return runRelayClient(addr, roomID, name, password, code, false)
+	if mode == roomModeRelay || mode == roomModeGuaranteed {
+		return runRelayClient(addr, roomID, name, password, code, false, mode)
 	}
 	return runClient(addr, roomID, name, password, code)
 }
@@ -159,7 +166,7 @@ func BuildRoomCode(addr, room string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
+	return roomproto.Wrap(roomproto.ProtocolDirect, base64.RawURLEncoding.EncodeToString(raw)), nil
 }
 
 func BuildRelayRoomCode(relayAddr, room string) (string, error) {
@@ -168,35 +175,59 @@ func BuildRelayRoomCode(relayAddr, room string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
+	return roomproto.Wrap(roomproto.ProtocolRelay, base64.RawURLEncoding.EncodeToString(raw)), nil
+}
+
+func RewriteCodeProtocol(code, protocol string) string {
+	p, payload := roomproto.Unwrap(code)
+	if p == "" {
+		return roomproto.Wrap(protocol, code)
+	}
+	return roomproto.Wrap(protocol, payload)
 }
 
 func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(code))
+	protocol, encoded := roomproto.Unwrap(code)
+	if protocol == roomproto.ProtocolP2P {
+		return roomCodePayload{}, errors.New("codigo p2p no valido para chat directo")
+	}
+	if encoded == "" {
+		encoded = strings.TrimSpace(code)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return roomCodePayload{}, err
 	}
 
-	var payload roomCodePayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	var rc roomCodePayload
+	if err := json.Unmarshal(raw, &rc); err != nil {
 		return roomCodePayload{}, err
 	}
-	if payload.Room == "" {
+	if rc.Room == "" {
 		return roomCodePayload{}, errors.New("codigo invalido")
 	}
-	if strings.TrimSpace(payload.Mode) == "" {
-		payload.Mode = roomModeDirect
+	switch protocol {
+	case roomproto.ProtocolRelay:
+		rc.Mode = roomModeRelay
+	case roomproto.ProtocolGuaranteed:
+		rc.Mode = roomModeGuaranteed
+	case roomproto.ProtocolDirect:
+		rc.Mode = roomModeDirect
+	default:
+		if strings.TrimSpace(rc.Mode) == "" {
+			rc.Mode = roomModeDirect
+		}
 	}
-	if payload.Mode == roomModeRelay {
-		if strings.TrimSpace(payload.Relay) == "" {
+	if rc.Mode == roomModeRelay || rc.Mode == roomModeGuaranteed {
+		if strings.TrimSpace(rc.Relay) == "" {
 			return roomCodePayload{}, errors.New("codigo relay invalido")
 		}
-		return payload, nil
+		return rc, nil
 	}
-	if strings.TrimSpace(payload.Addr) == "" {
+	if strings.TrimSpace(rc.Addr) == "" {
 		return roomCodePayload{}, errors.New("codigo directo invalido")
 	}
-	return payload, nil
+	return rc, nil
 }
 
 func ParseRoomCode(code string) (addr string, room string, err error) {

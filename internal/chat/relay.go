@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"brinco-cli/internal/logx"
+	"brinco-cli/internal/roomproto"
 )
 
 type relayHub struct {
@@ -29,6 +32,10 @@ type relayRoom struct {
 }
 
 func RunCreateUsingRelay(name, relayAddr, password string) int {
+	return RunCreateUsingRelayWithProtocol(name, relayAddr, password, roomproto.ProtocolRelay)
+}
+
+func RunCreateUsingRelayWithProtocol(name, relayAddr, password, protocol string) int {
 	if strings.TrimSpace(relayAddr) == "" {
 		fmt.Fprintln(os.Stderr, "Error: --relay es obligatorio en modo relay")
 		return 1
@@ -40,11 +47,16 @@ func RunCreateUsingRelay(name, relayAddr, password string) int {
 	if strings.TrimSpace(name) == "" {
 		name = "host"
 	}
+	if !roomproto.IsKnown(protocol) {
+		protocol = roomproto.ProtocolRelay
+	}
+	logx.Info("relay create start", "relay", relayAddr, "protocol", protocol)
 	fmt.Printf("Conectando al relay %s...\n", relayAddr)
-	return runRelayClient(relayAddr, "", name, password, "", true)
+	return runRelayClient(relayAddr, "", name, password, "", true, protocol)
 }
 
 func RunRelayServer(listenAddr, publicAddr string) int {
+	logx.Info("relay server start", "listen", listenAddr, "public", publicAddr)
 	if strings.TrimSpace(listenAddr) == "" {
 		listenAddr = "0.0.0.0:10000"
 	}
@@ -77,8 +89,10 @@ func RunRelayServer(listenAddr, publicAddr string) int {
 		conn, err := ln.Accept()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Relay accept error: %v\n", err)
+			logx.Error("relay accept error", "err", err)
 			return 1
 		}
+		logx.Debug("relay connection accepted", "remote", conn.RemoteAddr().String())
 		go hub.handleConn(conn)
 	}
 }
@@ -130,6 +144,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		}
 		client.name = room.uniqueName(name)
 		room.addClient(client)
+		logx.Info("relay room created", "room", room.id, "user", client.name)
 		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Sala relay creada", Code: room.code, Peers: room.peerNames(), At: time.Now().Unix()})
 	case msgTypeJoin:
 		room = h.getRoom(first.Room)
@@ -147,6 +162,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		}
 		client.name = room.uniqueName(name)
 		room.addClient(client)
+		logx.Info("relay room join", "room", room.id, "user", client.name)
 		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Conectado a la sala relay", Code: room.code, Peers: room.peerNames(), At: time.Now().Unix()})
 		room.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, client)
 	default:
@@ -177,6 +193,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 
 cleanup:
 	room.removeClient(client)
+	logx.Info("relay room leave", "room", room.id, "user", client.name)
 	room.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s salio", client.name), At: time.Now().Unix()}, nil)
 	if room.clientCount() == 0 {
 		h.deleteRoom(room.id)
@@ -284,10 +301,11 @@ func (r *relayRoom) broadcast(msg wireMessage, except *serverClient) {
 	}
 }
 
-func runRelayClient(relayAddr, roomID, name, password, roomCode string, create bool) int {
+func runRelayClient(relayAddr, roomID, name, password, roomCode string, create bool, codeProtocol string) int {
 	conn, err := net.Dial("tcp", relayAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error conectando: %v\n", err)
+		logx.Error("relay dial failed", "relay", relayAddr, "err", err)
 		return 1
 	}
 	defer conn.Close()
@@ -317,6 +335,9 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				continue
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Code) != "" {
+				if create && strings.TrimSpace(codeProtocol) != "" {
+					msg.Code = RewriteCodeProtocol(msg.Code, codeProtocol)
+				}
 				select {
 				case codeCh <- msg.Code:
 				default:
@@ -338,6 +359,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		case c := <-codeCh:
 			roomCode = c
 			_ = SaveLastRoomCode(c)
+			logx.Info("relay room code received", "protocol", codeProtocol)
 		default:
 		}
 
