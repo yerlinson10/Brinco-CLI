@@ -53,22 +53,6 @@ nfpms:
       - rpm
     bindir: /usr/local/bin
 
-brews:
-  - name: brinco
-    repository:
-      owner: yerlinson10
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-      branch: main
-    homepage: https://github.com/yerlinson10/Brinco-CLI
-    description: Chat CLI P2P en Go con salas y codigos de invitacion
-    directory: Formula
-    commit_author:
-      name: brinco-bot
-      email: actions@github.com
-    test: |
-      system "#{bin}/brinco", "version"
-
 scoops:
   - name: brinco
     repository:
