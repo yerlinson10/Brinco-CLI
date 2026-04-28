@@ -1,0 +1,14 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
