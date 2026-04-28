@@ -56,8 +56,8 @@ nfpms:
 brews:
   - name: brinco
     repository:
-      owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
-      name: "{{ .Env.HOMEBREW_TAP_REPO }}"
+      owner: yerlinson10
+      name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
       branch: main
     homepage: https://github.com/yerlinson10/Brinco-CLI
@@ -72,8 +72,8 @@ brews:
 scoops:
   - name: brinco
     repository:
-      owner: "{{ .Env.SCOOP_BUCKET_OWNER }}"
-      name: "{{ .Env.SCOOP_BUCKET_REPO }}"
+      owner: yerlinson10
+      name: scoop-bucket
       token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
       branch: main
     homepage: https://github.com/yerlinson10/Brinco-CLI

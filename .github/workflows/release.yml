@@ -33,11 +33,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_OWNER: ${{ vars.HOMEBREW_TAP_OWNER }}
-          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-          SCOOP_BUCKET_OWNER: ${{ vars.SCOOP_BUCKET_OWNER }}
-          SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
 
       - name: Run GoReleaser snapshot (manual)
