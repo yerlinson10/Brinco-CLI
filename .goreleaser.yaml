@@ -1,0 +1,97 @@
+project_name: brinco
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: brinco
+    main: ./cmd/brinco
+    binary: brinco
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: brinco_archives
+    builds:
+      - brinco
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: yerlinson10
+    name: Brinco-CLI
+
+nfpms:
+  - id: brinco_linux_packages
+    package_name: brinco
+    homepage: https://github.com/yerlinson10/Brinco-CLI
+    description: Chat CLI P2P en Go con salas y codigos de invitacion
+    maintainer: Yerlinson <noreply@github.com>
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/local/bin
+
+brews:
+  - name: brinco
+    disable: "{{ or (eq .Env.HOMEBREW_TAP_OWNER \"\") (or (eq .Env.HOMEBREW_TAP_REPO \"\") (eq .Env.HOMEBREW_TAP_GITHUB_TOKEN \"\")) }}"
+    repository:
+      owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
+      name: "{{ .Env.HOMEBREW_TAP_REPO }}"
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      branch: main
+    homepage: https://github.com/yerlinson10/Brinco-CLI
+    description: Chat CLI P2P en Go con salas y codigos de invitacion
+    directory: Formula
+    commit_author:
+      name: brinco-bot
+      email: actions@github.com
+    test: |
+      system "#{bin}/brinco", "version"
+
+scoops:
+  - name: brinco
+    disable: "{{ or (eq .Env.SCOOP_BUCKET_OWNER \"\") (or (eq .Env.SCOOP_BUCKET_REPO \"\") (eq .Env.SCOOP_BUCKET_GITHUB_TOKEN \"\")) }}"
+    repository:
+      owner: "{{ .Env.SCOOP_BUCKET_OWNER }}"
+      name: "{{ .Env.SCOOP_BUCKET_REPO }}"
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+      branch: main
+    homepage: https://github.com/yerlinson10/Brinco-CLI
+    description: Chat CLI P2P en Go con salas y codigos de invitacion
+    commit_author:
+      name: brinco-bot
+      email: actions@github.com
+
+chocolateys:
+  - name: brinco
+    disable: "{{ eq .Env.CHOCOLATEY_API_KEY \"\" }}"
+    title: brinco
+    authors: Yerlinson
+    project_url: https://github.com/yerlinson10/Brinco-CLI
+    url_template: "https://github.com/yerlinson10/Brinco-CLI/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    source_repo: "https://push.chocolatey.org/"
+    api_key: "{{ .Env.CHOCOLATEY_API_KEY }}"
+    description: |
+      Chat CLI P2P en Go con salas, codigos de invitacion y multiples modos de conexion.
+    summary: Chat CLI P2P en Go
+    release_notes: "https://github.com/yerlinson10/Brinco-CLI/releases/tag/{{ .Tag }}"

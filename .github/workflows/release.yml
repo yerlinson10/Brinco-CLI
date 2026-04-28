@@ -1,4 +1,4 @@
-name: Build and Publish Binaries
+name: Release Packages and Installers
 
 on:
   release:
@@ -9,32 +9,51 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+  goreleaser:
+    name: Build and publish packages
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: windows
-            goarch: amd64
-            ext: .exe
-          - goos: windows
-            goarch: arm64
-            ext: .exe
-          - goos: linux
-            goarch: amd64
-            ext: ""
-          - goos: linux
-            goarch: arm64
-            ext: ""
-          - goos: darwin
-            goarch: amd64
-            ext: ""
-          - goos: darwin
-            goarch: arm64
-            ext: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        if: github.event_name == 'release'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: ~> v2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_OWNER: ${{ vars.HOMEBREW_TAP_OWNER }}
+          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          SCOOP_BUCKET_OWNER: ${{ vars.SCOOP_BUCKET_OWNER }}
+          SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
+          SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+
+      - name: Run GoReleaser snapshot (manual)
+        if: github.event_name != 'release'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: ~> v2
+          args: release --clean --snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  windows-installer:
+    name: Build Windows installer exe
+    runs-on: windows-latest
+    needs: goreleaser
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,28 +63,34 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+      - name: Build Windows executable
+        shell: powershell
         run: |
-          mkdir -p dist
-          VERSION="${GITHUB_REF_NAME}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "" ]; then
-            VERSION="dev"
-          fi
-          OUT="dist/brinco-${VERSION}-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags "-s -w" -o "$OUT" ./cmd/brinco
+          New-Item -ItemType Directory -Force -Path dist/windows-installer | Out-Null
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "0"
+          go build -trimpath -ldflags "-s -w" -o dist/windows-installer/brinco.exe ./cmd/brinco
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Build installer with Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.6
         with:
-          name: brinco-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
+          path: packaging/windows/brinco.iss
+        env:
+          BRINCO_VERSION: ${{ github.ref_name }}
 
-      - name: Upload release asset
+      - name: Upload installer to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            Output/Brinco-Setup-*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload installer artifact (manual)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: brinco-windows-installer
+          path: Output/Brinco-Setup-*.exe

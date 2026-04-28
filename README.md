@@ -62,12 +62,74 @@ brinco room create --mode guaranteed --name Ana
 brinco room join --name Luis --code CODIGO
 ```
 
+## Instalacion por gestores y release automatico
+
+El proyecto ya incluye un pipeline de release que puede generar y publicar:
+1. Scoop
+2. Chocolatey
+3. deb y rpm
+4. Homebrew
+5. Instalador Windows .exe (Inno Setup)
+
+### Instalar por gestor (usuario final)
+
+Scoop:
+```powershell
+scoop bucket add brinco-bucket https://github.com/TU_USUARIO/scoop-bucket
+scoop install brinco
+```
+
+Chocolatey:
+```powershell
+choco install brinco
+```
+
+Homebrew:
+```bash
+brew tap TU_USUARIO/homebrew-tap
+brew install brinco
+```
+
+deb/rpm:
+1. Descarga el archivo .deb o .rpm desde Releases.
+2. Instala con:
+```bash
+# Debian/Ubuntu
+sudo dpkg -i brinco_*.deb
+
+# RHEL/Fedora
+sudo rpm -i brinco-*.rpm
+```
+
+Instalador Windows .exe:
+1. Descarga Brinco-Setup-<version>.exe desde Releases.
+2. Ejecuta el instalador y finaliza el wizard.
+3. (Opcional) marca Add Brinco to PATH durante la instalacion.
+
+### Que necesita GitHub Actions para publicar todo automaticamente
+
+Variables de repositorio (Settings > Secrets and variables > Actions > Variables):
+1. HOMEBREW_TAP_OWNER
+2. HOMEBREW_TAP_REPO
+3. SCOOP_BUCKET_OWNER
+4. SCOOP_BUCKET_REPO
+
+Secrets de repositorio (Settings > Secrets and variables > Actions > Secrets):
+1. HOMEBREW_TAP_GITHUB_TOKEN
+2. SCOOP_BUCKET_GITHUB_TOKEN
+3. CHOCOLATEY_API_KEY
+
+Notas:
+1. El workflow de release siempre sube binarios, checksums, deb/rpm e instalador .exe al Release actual.
+2. Homebrew/Scoop/Chocolatey se publican solo si sus variables y secrets estan configurados.
+
 ---
 
 ## Tabla de contenidos
 
 - [Que hace Brinco y que debes hacer primero](#que-hace-brinco-y-que-debes-hacer-primero)
 - [Uso con binario compilado (sin go run)](#uso-con-binario-compilado-sin-go-run)
+- [Instalacion por gestores y release automatico](#instalacion-por-gestores-y-release-automatico)
 - [Caracteristicas](#caracteristicas)
 - [Requisitos](#requisitos)
 - [Instalacion](#instalacion)
