@@ -149,7 +149,7 @@ func RunJoin(name, code, relayAddr string) int {
 }
 
 // RunCreateGuaranteed crea una sala usando libp2p con relay automatico de la red IPFS.
-// No requiere relay manual: descubre relays dinamicamente desde los bootstrap de IPFS.
+// No requiere relay manual: descubre relays dinamicamente via DHT.
 func RunCreateGuaranteed(name string) int {
 	logx.Info("p2p guaranteed create start")
 	if strings.TrimSpace(name) == "" {
@@ -167,8 +167,21 @@ func RunCreateGuaranteed(name string) int {
 
 	node.SetName(name)
 
-	fmt.Println("Conectando a la red P2P (con relay automatico IPFS)...")
+	fmt.Println("Conectando a la red P2P y buscando relays...")
 	node.Bootstrap(nil)
+
+	// Esperar hasta 30 segundos a que AutoRelay reserve un slot en un relay.
+	// Esto es clave: sin relay address en el codigo, el otro peer no podra conectar.
+	fmt.Print("Esperando direccion relay")
+	gotRelay := node.WaitForRelay(30 * time.Second)
+	fmt.Println()
+	if gotRelay {
+		fmt.Println("Relay obtenido exitosamente")
+		logx.Info("guaranteed: relay address obtenida")
+	} else {
+		fmt.Println("Aviso: no se obtuvo relay. Se usaran direcciones directas.")
+		logx.Warn("guaranteed: timeout esperando relay")
+	}
 
 	topic, err := RandomTopic()
 	if err != nil {
@@ -201,7 +214,7 @@ func RunCreateGuaranteed(name string) int {
 }
 
 // RunJoinGuaranteed se une a una sala en modo guaranteed usando libp2p con relay
-// automatico de la red IPFS. No requiere relay manual.
+// automatico via DHT de la red IPFS. No requiere relay manual.
 func RunJoinGuaranteed(name, code string) int {
 	logx.Info("p2p guaranteed join start")
 	if strings.TrimSpace(name) == "" {
@@ -229,8 +242,20 @@ func RunJoinGuaranteed(name, code string) int {
 
 	node.SetName(name)
 
-	fmt.Println("Conectando a la red P2P (con relay automatico IPFS)...")
+	fmt.Println("Conectando a la red P2P y buscando relays...")
 	node.Bootstrap(nil)
+
+	// Esperar relay para poder ser alcanzado por el otro peer.
+	fmt.Print("Esperando direccion relay")
+	gotRelay := node.WaitForRelay(30 * time.Second)
+	fmt.Println()
+	if gotRelay {
+		fmt.Println("Relay obtenido exitosamente")
+		logx.Info("guaranteed join: relay address obtenida")
+	} else {
+		fmt.Println("Aviso: no se obtuvo relay. Intentando conexion directa...")
+		logx.Warn("guaranteed join: timeout esperando relay")
+	}
 
 	if err := node.JoinTopic(payload.Topic); err != nil {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
@@ -240,10 +265,12 @@ func RunJoinGuaranteed(name, code string) int {
 	if len(payload.Peers) > 0 {
 		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
 		node.SetRoomPeers(payload.Peers)
-		node.ConnectToPeersWithRetry(payload.Peers, 5, 700*time.Millisecond)
+		node.ConnectToPeersWithRetry(payload.Peers, 8, 1*time.Second)
 		if node.TopicPeerCount() == 0 {
-			fmt.Println("Sin enlace directo. Los relays de la red IPFS intentaran la ruta automaticamente...")
-			logx.Warn("guaranteed join sin peers directos, esperando relay automatico")
+			fmt.Println("Aviso: sin enlace aun. El relay negociara la conexion en segundo plano...")
+			logx.Warn("guaranteed join sin peers directos tras reintentos")
+		} else {
+			fmt.Printf("Enlazado con %d peer(s)\n", node.TopicPeerCount())
 		}
 	}
 

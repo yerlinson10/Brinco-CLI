@@ -18,6 +18,7 @@ import (
 	"brinco-cli/internal/roomproto"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -64,15 +65,45 @@ type Node struct {
 	seenMsgs map[string]time.Time
 }
 
-// NewNodeGuaranteed crea un nodo libp2p que usa los bootstrap publicos de IPFS
-// como candidatos de relay automatico. No requiere configurar ningun relay manual.
+// NewNodeGuaranteed crea un nodo libp2p que usa el DHT de la red IPFS para
+// descubrir relays circuit v2 automaticamente. Fuerza reachability privada para
+// que el auto-relay siempre busque y reserve slots en relays disponibles.
 func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, error) {
 	retx, cancel := context.WithCancel(ctx)
-	logx.Debug("p2p guaranteed node init")
+	logx.Debug("p2p guaranteed node init (DHT + AutoRelay)")
 
-	// Bootstrap IPFS + extras del usuario como candidatos de relay estatico.
-	// Los nodos de bootstrap de la red IPFS soportan circuit relay v2.
-	allRelays := append(append([]string(nil), defaultBootstrapPeers...), extraRelayAddrs...)
+	// Variable que se asigna despues de crear el host.
+	var kdht *dht.IpfsDHT
+	var h host.Host
+
+	// Peer source para AutoRelay: busca peers del routing table del DHT.
+	peerSource := func(pctx context.Context, numPeers int) <-chan peer.AddrInfo {
+		ch := make(chan peer.AddrInfo, numPeers)
+		go func() {
+			defer close(ch)
+			if kdht == nil || h == nil {
+				return
+			}
+			peers := kdht.RoutingTable().ListPeers()
+			count := 0
+			for _, p := range peers {
+				if count >= numPeers {
+					break
+				}
+				addrs := h.Peerstore().Addrs(p)
+				if len(addrs) == 0 {
+					continue
+				}
+				select {
+				case ch <- peer.AddrInfo{ID: p, Addrs: addrs}:
+					count++
+				case <-pctx.Done():
+					return
+				}
+			}
+		}()
+		return ch
+	}
 
 	opts := []libp2p.Option{
 		libp2p.NoTransports,
@@ -84,14 +115,29 @@ func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, er
 		libp2p.EnableNATService(),
 		libp2p.NATPortMap(),
 		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelayWithStaticRelays(peerInfosFromAddrs(allRelays)),
+		libp2p.ForceReachabilityPrivate(),
+		libp2p.EnableAutoRelayWithPeerSource(peerSource),
 		libp2p.EnableHolePunching(),
 	}
 
-	h, err := libp2p.New(opts...)
+	var err error
+	h, err = libp2p.New(opts...)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error creando nodo: %w", err)
+	}
+
+	// DHT en modo cliente: descubre peers relay sin servir como router.
+	kdht, err = dht.New(retx, h, dht.Mode(dht.ModeClient))
+	if err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, fmt.Errorf("error creando DHT: %w", err)
+	}
+	if err := kdht.Bootstrap(retx); err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, fmt.Errorf("error bootstrap DHT: %w", err)
 	}
 
 	ps, err := pubsub.NewGossipSub(
@@ -177,6 +223,25 @@ func (n *Node) Bootstrap(customRelays []string) {
 	// mDNS para descubrimiento local (LAN)
 	svc := mdns.NewMdnsService(n.host, "brinco-chat", &mdnsNotifee{host: n.host, ctx: n.ctx})
 	_ = svc.Start()
+}
+
+// WaitForRelay espera hasta obtener al menos una direccion relay (p2p-circuit)
+// o hasta que expire el timeout. Devuelve true si se encontro relay.
+func (n *Node) WaitForRelay(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, addr := range n.host.Addrs() {
+			if strings.Contains(addr.String(), "p2p-circuit") {
+				return true
+			}
+		}
+		select {
+		case <-n.ctx.Done():
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // JoinTopic suscribe al topic de la sala
