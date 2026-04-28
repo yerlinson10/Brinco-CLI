@@ -280,9 +280,12 @@ func RandomTopic() (string, error) {
 func (n *Node) RunChat(roomCode string) int {
 	go n.receiveLoop()
 
-	fmt.Println("Conectado a la sala")
+	fmt.Println("Conectado al topic de la sala")
+	if n.TopicPeerCount() == 0 {
+		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
+	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /quit /help")
+	fmt.Println("Comandos: /code /peers /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -308,8 +311,10 @@ func (n *Node) RunChat(roomCode string) int {
 				return 0
 			case "/code":
 				fmt.Printf("Codigo de sala: %s\n", roomCode)
+			case "/peers":
+				fmt.Printf("Peers enlazados al topic: %d\n", n.TopicPeerCount())
 			case "/help":
-				fmt.Println("Comandos: /code /quit /help")
+				fmt.Println("Comandos: /code /peers /quit /help")
 			default:
 				fmt.Println("Comando no reconocido. Usa /help")
 			}
@@ -325,7 +330,7 @@ func (n *Node) RunChat(roomCode string) int {
 func (n *Node) publishChatReliable(text string) error {
 	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix()}
 	var lastErr error
-	for i := 0; i < 18; i++ {
+	for i := 0; i < 80; i++ {
 		if n.TopicPeerCount() == 0 && len(n.roomPeers) > 0 {
 			n.ConnectToPeers(n.roomPeers)
 		}
@@ -339,7 +344,7 @@ func (n *Node) publishChatReliable(text string) error {
 	if lastErr != nil {
 		return lastErr
 	}
-	return fmt.Errorf("aun no hay peers conectados en la sala")
+	return fmt.Errorf("no hay peers conectados en la sala (sin ruta directa); prueba --relay o --direct con puertos abiertos")
 }
 
 func (n *Node) receiveLoop() {

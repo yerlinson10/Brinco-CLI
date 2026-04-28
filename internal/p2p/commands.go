@@ -133,6 +133,9 @@ func RunJoin(name, code, relayAddr string) int {
 		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
 		node.SetRoomPeers(payload.Peers)
 		node.ConnectToPeersWithRetry(payload.Peers, 5, 700*time.Millisecond)
+		if node.TopicPeerCount() == 0 {
+			fmt.Println("Aviso: no se logro enlace directo con peers. El chat puede no enviar/recibir sin relay o puertos abiertos.")
+		}
 	}
 
 	_ = node.Publish(name+" se unio", "system")
