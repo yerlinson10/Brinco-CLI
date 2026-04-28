@@ -131,6 +131,7 @@ func RunJoin(name, code, relayAddr string) int {
 
 	if len(payload.Peers) > 0 {
 		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
+		node.SetRoomPeers(payload.Peers)
 		node.ConnectToPeersWithRetry(payload.Peers, 5, 700*time.Millisecond)
 	}
 

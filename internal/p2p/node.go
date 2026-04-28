@@ -41,20 +41,21 @@ type chatMessage struct {
 }
 
 type roomCodePayload struct {
-	Topic string `json:"topic"`
-	Relay string `json:"relay,omitempty"`
+	Topic string   `json:"topic"`
+	Relay string   `json:"relay,omitempty"`
 	Peers []string `json:"peers,omitempty"`
 }
 
 // Node es el nodo libp2p del usuario
 type Node struct {
-	host   host.Host
-	ps     *pubsub.PubSub
-	topic  *pubsub.Topic
-	sub    *pubsub.Subscription
-	name   string
-	ctx    context.Context
-	cancel context.CancelFunc
+	host      host.Host
+	ps        *pubsub.PubSub
+	topic     *pubsub.Topic
+	sub       *pubsub.Subscription
+	name      string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	roomPeers []string
 
 	seenMu   sync.Mutex
 	seenMsgs map[string]time.Time
@@ -147,6 +148,10 @@ func (n *Node) JoinTopic(topic string) error {
 // Publish envía un mensaje al topic de la sala
 func (n *Node) Publish(text string, msgType string) error {
 	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: msgType, At: time.Now().Unix()}
+	return n.publishMessage(msg)
+}
+
+func (n *Node) publishMessage(msg chatMessage) error {
 	raw, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -165,6 +170,10 @@ func (n *Node) TopicPeerCount() int {
 // SetName asigna el nombre del usuario
 func (n *Node) SetName(name string) {
 	n.name = name
+}
+
+func (n *Node) SetRoomPeers(peers []string) {
+	n.roomPeers = append([]string(nil), peers...)
 }
 
 // Close cierra el nodo
@@ -314,20 +323,17 @@ func (n *Node) RunChat(roomCode string) int {
 }
 
 func (n *Node) publishChatReliable(text string) error {
+	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix()}
 	var lastErr error
-	for i := 0; i < 4; i++ {
-		if n.TopicPeerCount() == 0 {
+	for i := 0; i < 18; i++ {
+		if n.TopicPeerCount() == 0 && len(n.roomPeers) > 0 {
+			n.ConnectToPeers(n.roomPeers)
+		}
+		if err := n.publishMessage(msg); err != nil {
+			lastErr = err
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		if err := n.Publish(text, "chat"); err != nil {
-			lastErr = err
-			time.Sleep(180 * time.Millisecond)
-			continue
-		}
-		// Segundo publish corto para reducir perdidas puntuales en mallas pequenas.
-		time.Sleep(120 * time.Millisecond)
-		_ = n.Publish(text, "chat")
 		return nil
 	}
 	if lastErr != nil {
