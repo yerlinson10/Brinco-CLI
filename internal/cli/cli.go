@@ -1,4 +1,4 @@
-package cli
+﻿package cli
 
 import (
 	"flag"
@@ -6,9 +6,10 @@ import (
 	"os"
 
 	"brinco-cli/internal/chat"
+	p2pcmd "brinco-cli/internal/p2p"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func Run(args []string) int {
 	if len(args) == 0 {
@@ -23,15 +24,10 @@ func Run(args []string) int {
 	case "version", "-v", "--version":
 		fmt.Printf("brinco-cli %s\n", version)
 		return 0
+	case "relay":
+		return runRelay(args[1:])
 	case "room":
 		return runRoom(args[1:])
-	case "hello":
-		name := "mundo"
-		if len(args) > 1 {
-			name = args[1]
-		}
-		fmt.Printf("Hola, %s!\n", name)
-		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "Comando no reconocido: %s\n\n", args[0])
 		printHelp()
@@ -50,30 +46,46 @@ func runRoom(args []string) int {
 		fs := flag.NewFlagSet("room create", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
 		name := fs.String("name", "host", "Nombre de usuario")
-		listen := fs.String("listen", "0.0.0.0:9090", "Direccion local host:puerto")
-		public := fs.String("public", "", "Direccion publica host:puerto para generar codigo")
-		password := fs.String("password", "", "Password de la sala")
+		relay := fs.String("relay", "", "Multiaddr relay propio (opcional)")
+		direct := fs.Bool("direct", false, "Modo TCP directo (requiere IP publica)")
+		listen := fs.String("listen", "0.0.0.0:9090", "[--direct] Direccion local")
+		public := fs.String("public", "", "[--direct] Direccion publica host:puerto")
+		password := fs.String("password", "", "[--direct] Password de la sala")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
-		return chat.RunCreate(*name, *listen, *public, *password)
+		if *direct {
+			if *relay != "" {
+				return chat.RunCreateUsingRelay(*name, *relay, *password)
+			}
+			return chat.RunCreate(*name, *listen, *public, *password)
+		}
+		return p2pcmd.RunCreate(*name, *relay)
 
 	case "join":
 		fs := flag.NewFlagSet("room join", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
 		name := fs.String("name", "guest", "Nombre de usuario")
 		code := fs.String("code", "", "Codigo de la sala")
-		password := fs.String("password", "", "Password de la sala")
+		relay := fs.String("relay", "", "Multiaddr relay propio (opcional)")
+		direct := fs.Bool("direct", false, "Modo TCP directo")
+		password := fs.String("password", "", "[--direct] Password de la sala")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
-		return chat.RunJoin(*name, *code, *password)
+		if *direct {
+			return chat.RunJoin(*name, *code, *password)
+		}
+		return p2pcmd.RunJoin(*name, *code, *relay)
 
 	case "code":
-		code, err := chat.LoadLastRoomCode()
+		code, err := p2pcmd.LoadLastCode()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
+			code, err = chat.LoadLastRoomCode()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: no hay codigo guardado\n")
+				return 1
+			}
 		}
 		fmt.Println(code)
 		return 0
@@ -89,48 +101,40 @@ func runRoom(args []string) int {
 	}
 }
 
+func runRelay(args []string) int {
+	if len(args) == 0 {
+		printRelayHelp()
+		return 0
+	}
+
+	switch args[0] {
+	case "serve":
+		fs := flag.NewFlagSet("relay serve", flag.ContinueOnError)
+		fs.SetOutput(os.Stderr)
+		listen := fs.String("listen", "0.0.0.0:10000", "Direccion local del relay host:puerto")
+		public := fs.String("public", "", "Direccion publica del relay host:puerto")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 1
+		}
+		return chat.RunRelayServer(*listen, *public)
+	case "help", "-h", "--help":
+		printRelayHelp()
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "Subcomando relay no reconocido: %s\n\n", args[0])
+		printRelayHelp()
+		return 1
+	}
+}
+
 func printHelp() {
-	fmt.Println(`brinco-cli - CLI con chat P2P por salas
-
-Uso:
-  brinco <comando> [argumentos]
-
-Comandos:
-  room create       Crea una sala de chat
-  room join         Se une a una sala por codigo
-  room code         Muestra ultimo codigo de sala creado
-  room help         Ayuda de subcomandos room
-  version           Muestra la version
-  help              Muestra esta ayuda
-
-Ejemplos:
-  brinco room create --name Ana --listen 0.0.0.0:9090 --public 203.0.113.10:9090 --password secreto
-  brinco room code
-  brinco room join --name Luis --code <codigo> --password secreto
-  brinco version`)
+	fmt.Println("brinco-cli v" + version + " - Chat P2P descentralizado\n\nUso:\n  brinco <comando> [argumentos]\n\nComandos:\n  room create       Crea sala (libp2p, gratis, sin servidor)\n  room join         Se une a sala por codigo\n  room code         Muestra ultimo codigo de sala\n  relay serve       Levanta relay TCP propio (opcional)\n  version           Muestra la version\n  help              Muestra esta ayuda\n\nInicio rapido (sin servidor, gratis):\n  brinco room create --name Ana\n  brinco room join --name Luis --code <codigo>\n\nCon relay propio (opcional):\n  brinco relay serve --listen 0.0.0.0:10000 --public <IP>:10000\n  brinco room create --name Ana --relay /ip4/<IP>/tcp/10000/p2p/<PeerID>")
 }
 
 func printRoomHelp() {
-	fmt.Println(`Uso:
-  brinco room <subcomando> [flags]
+	fmt.Println("Uso:\n  brinco room <subcomando> [flags]\n\nSubcomandos:\n  create    Crea sala y entra al chat (libp2p por defecto)\n  join      Se une a sala usando codigo\n  code      Muestra el ultimo codigo guardado\n  help      Muestra esta ayuda\n\ncreate flags:\n  --name     Nombre visible (default: host)\n  --relay    Multiaddr relay propio (opcional)\n  --direct   Modo TCP directo (requiere IP publica)\n\njoin flags:\n  --name     Nombre visible (default: guest)\n  --code     Codigo de sala (obligatorio)\n  --relay    Multiaddr relay propio (opcional)\n  --direct   Modo TCP directo\n\nDentro del chat:\n  /code  /quit  /help")
+}
 
-Subcomandos:
-  create    Crea una sala y entra al chat
-  join      Se une a una sala usando codigo
-  code      Muestra el ultimo codigo de sala guardado
-  help      Muestra esta ayuda
-
-Create flags:
-  --name       Nombre visible en la sala (default: host)
-  --listen     Direccion local host:puerto (default: 0.0.0.0:9090)
-  --public     Direccion publica host:puerto para codigo
-  --password   Password de la sala (obligatorio)
-
-Join flags:
-  --name       Nombre visible en la sala (default: guest)
-  --code       Codigo de la sala (obligatorio)
-  --password   Password de la sala (obligatorio)
-
-Dentro del chat:
-  /code  /peers  /quit  /help`)
+func printRelayHelp() {
+	fmt.Println("Uso:\n  brinco relay serve [flags]\n\nFlags:\n  --listen   Direccion local (default: 0.0.0.0:10000)\n  --public   Direccion publica host:puerto\n\nNota: el relay propio es OPCIONAL.\nSin el, brinco usa la red publica libp2p/IPFS gratuitamente.")
 }

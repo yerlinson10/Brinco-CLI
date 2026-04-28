@@ -20,6 +20,7 @@ import (
 )
 
 const (
+	msgTypeCreate   = "create"
 	msgTypeJoin     = "join"
 	msgTypeWelcome  = "welcome"
 	msgTypeChat     = "chat"
@@ -29,12 +30,17 @@ const (
 	msgTypePeers    = "peers"
 	msgTypeQuit     = "quit"
 
+	roomModeDirect = "direct"
+	roomModeRelay  = "relay"
+
 	lastRoomCodeFile = "brinco-last-room-code.txt"
 )
 
 type roomCodePayload struct {
-	Addr string `json:"addr"`
-	Room string `json:"room"`
+	Mode  string `json:"mode,omitempty"`
+	Addr  string `json:"addr,omitempty"`
+	Relay string `json:"relay,omitempty"`
+	Room  string `json:"room"`
 }
 
 type wireMessage struct {
@@ -124,18 +130,31 @@ func RunJoin(name, code, password string) int {
 		name = "guest"
 	}
 
-	addr, roomID, err := ParseRoomCode(code)
+	payload, err := ParseRoomCodeDetailed(code)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parseando codigo: %v\n", err)
 		return 1
 	}
 
+	addr := payload.Addr
+	if strings.TrimSpace(payload.Relay) != "" {
+		addr = payload.Relay
+	}
+	roomID := payload.Room
+	mode := payload.Mode
+	if mode == "" {
+		mode = roomModeDirect
+	}
+
 	fmt.Printf("Conectando a %s...\n", addr)
+	if mode == roomModeRelay {
+		return runRelayClient(addr, roomID, name, password, code, false)
+	}
 	return runClient(addr, roomID, name, password, code)
 }
 
 func BuildRoomCode(addr, room string) (string, error) {
-	payload := roomCodePayload{Addr: addr, Room: room}
+	payload := roomCodePayload{Mode: roomModeDirect, Addr: addr, Room: room}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -143,18 +162,50 @@ func BuildRoomCode(addr, room string) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-func ParseRoomCode(code string) (addr string, room string, err error) {
+func BuildRelayRoomCode(relayAddr, room string) (string, error) {
+	payload := roomCodePayload{Mode: roomModeRelay, Relay: relayAddr, Room: room}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(code))
 	if err != nil {
-		return "", "", err
+		return roomCodePayload{}, err
 	}
 
 	var payload roomCodePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
+		return roomCodePayload{}, err
+	}
+	if payload.Room == "" {
+		return roomCodePayload{}, errors.New("codigo invalido")
+	}
+	if strings.TrimSpace(payload.Mode) == "" {
+		payload.Mode = roomModeDirect
+	}
+	if payload.Mode == roomModeRelay {
+		if strings.TrimSpace(payload.Relay) == "" {
+			return roomCodePayload{}, errors.New("codigo relay invalido")
+		}
+		return payload, nil
+	}
+	if strings.TrimSpace(payload.Addr) == "" {
+		return roomCodePayload{}, errors.New("codigo directo invalido")
+	}
+	return payload, nil
+}
+
+func ParseRoomCode(code string) (addr string, room string, err error) {
+	payload, err := ParseRoomCodeDetailed(code)
+	if err != nil {
 		return "", "", err
 	}
-	if payload.Addr == "" || payload.Room == "" {
-		return "", "", errors.New("codigo invalido")
+	if strings.TrimSpace(payload.Relay) != "" {
+		return payload.Relay, payload.Room, nil
 	}
 	return payload.Addr, payload.Room, nil
 }
