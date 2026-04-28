@@ -7,10 +7,67 @@ Brinco-CLI esta escrito en Go y usa [libp2p](https://libp2p.io/) (la misma red q
 establecer conexiones entre pares. Cada sala genera un codigo de invitacion unico que incluye
 el protocolo usado, por lo que unirse es tan simple como pegar el codigo.
 
+## Que hace Brinco y que debes hacer primero
+
+Brinco te permite crear una sala de chat P2P desde terminal, compartir un codigo y empezar a
+chatear sin servidor central.
+
+Pasos minimos para usarlo:
+1. Tener el ejecutable `brinco` (o `brinco.exe`) compilado.
+2. Abrir una terminal.
+3. Crear sala: `brinco room create --mode guaranteed --name Ana`.
+4. Compartir el codigo generado.
+5. El otro usuario se une: `brinco room join --name Luis --code CODIGO`.
+
+## Uso con binario compilado (sin go run)
+
+Si ya tienes el archivo compilado, puedes usar Brinco como comando global en consola.
+
+### Windows
+
+1. Compila:
+```powershell
+go build -o bin/brinco.exe ./cmd/brinco
+```
+2. Agrega la carpeta `bin` al PATH o copia `brinco.exe` a una carpeta del PATH.
+3. Cierra y abre la terminal.
+4. Verifica:
+```powershell
+brinco version
+```
+
+### Linux / macOS
+
+1. Compila:
+```bash
+go build -o bin/brinco ./cmd/brinco
+```
+2. Da permisos y mueve al PATH:
+```bash
+chmod +x bin/brinco
+sudo mv bin/brinco /usr/local/bin/brinco
+```
+3. Verifica:
+```bash
+brinco version
+```
+
+### Flujo rapido con binario
+
+```bash
+# Usuario A
+brinco room create --mode guaranteed --name Ana
+
+# Usuario B
+brinco room join --name Luis --code CODIGO
+```
+
 ---
 
 ## Tabla de contenidos
 
+- [Que hace Brinco y que debes hacer primero](#que-hace-brinco-y-que-debes-hacer-primero)
+- [Uso con binario compilado (sin go run)](#uso-con-binario-compilado-sin-go-run)
 - [Caracteristicas](#caracteristicas)
 - [Requisitos](#requisitos)
 - [Instalacion](#instalacion)
