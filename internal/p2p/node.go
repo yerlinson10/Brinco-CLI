@@ -465,6 +465,7 @@ func (n *Node) publishChatReliable(text string) error {
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
+		renderMessage(msg)
 		return nil
 	}
 	if lastErr != nil {
@@ -479,8 +480,9 @@ func (n *Node) receiveLoop() {
 		if err != nil {
 			return
 		}
-		// No mostrar mensajes propios
-		if msg.ReceivedFrom == n.host.ID() {
+		// Propios: Topic.Publish usa PushLocal con ReceivedFrom=host; el autor protobuf es nuestro peer ID.
+		// Los mostramos con eco local en publishChatReliable; aqui evitamos duplicados y confusion con el siguiente mensaje ajeno.
+		if msg.GetFrom() == n.host.ID() || msg.ReceivedFrom == n.host.ID() {
 			continue
 		}
 		var cm chatMessage
