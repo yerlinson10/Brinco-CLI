@@ -1,0 +1,9 @@
+{
+  "casa": {
+    "mode": "relay",
+    "relay": "127.0.0.1:10000",
+    "password": "demo",
+    "name": "yo",
+    "code": "relay-COLOCA_AQUI_EL_PAYLOAD_BASE64_DEL_CODIGO"
+  }
+}
