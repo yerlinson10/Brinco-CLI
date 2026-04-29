@@ -42,6 +42,7 @@ Permite crear una sala desde la terminal, compartir un código y chatear. El com
 - Cuatro modos: `p2p`, `guaranteed`, `relay`, `direct`; el código lleva el protocolo (`p2p-`, `guaranteed-`, …).
 - Join con `--mode auto` o sin modo: se infiere del prefijo del código.
 - **Asistente**: `brinco host`, `brinco join`, `brinco room create` o `brinco room join` sin argumentos extra (Enter en password = sala sin clave en relay/direct).
+- **Portapapeles**: al crear una sala (p2p, guaranteed, direct o relay cliente) el codigo se copia al portapapeles cuando el sistema lo permite (Windows `clip`, macOS `pbcopy`, Linux `wl-copy` / `xclip` / `xsel`).
 
 **Chat**
 

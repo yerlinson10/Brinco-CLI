@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 	"brinco-cli/internal/roomproto"
 )
@@ -539,6 +540,9 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		case c := <-codeCh:
 			roomCode = c
 			_ = SaveLastRoomCode(c)
+			if create {
+				clipboard.AnnounceRoomCode(c)
+			}
 			logx.Info("relay room code received", "protocol", codeProtocol)
 		default:
 		}

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 	"brinco-cli/internal/roomproto"
 )
@@ -183,6 +184,7 @@ func RunCreate(name, listenAddr, publicAddr, password string) int {
 
 	fmt.Println("Sala creada")
 	fmt.Printf("Codigo de sala: %s\n", code)
+	clipboard.AnnounceRoomCode(code)
 	fmt.Println("Comparte este codigo con tus peers")
 	logx.Info("chat sala creada", "mode", roomModeDirect, "room", roomID)
 
