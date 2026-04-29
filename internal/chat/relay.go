@@ -361,19 +361,25 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	codeCh := make(chan string, 1)
+	myNick := strings.TrimSpace(name)
+	if myNick == "" {
+		myNick = "guest"
+	}
+	var nickMu sync.RWMutex
 
 	go func() {
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
-		var myNick string
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
 				continue
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
+				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)
+				nickMu.Unlock()
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Code) != "" {
 				if create && strings.TrimSpace(codeProtocol) != "" {
@@ -384,7 +390,13 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				default:
 				}
 			}
-			renderWireMessage(msg, myNick)
+			nickMu.RLock()
+			currentNick := myNick
+			nickMu.RUnlock()
+			if shouldSkipOwnEcho(msg, currentNick) {
+				continue
+			}
+			renderWireMessage(msg, currentNick)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -392,7 +404,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -451,7 +463,9 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+			case "/clear":
+				clearConsole()
 			default:
 				if strings.HasPrefix(line, "/msg ") {
 					to, text, ok := parsePrivateCommand(line)
@@ -474,9 +488,14 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			continue
 		}
 
-		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: time.Now().Unix()}); err != nil {
+		at := time.Now().Unix()
+		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: at}); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enviando mensaje: %v\n", err)
 			return 1
 		}
+		nickMu.RLock()
+		currentNick := myNick
+		nickMu.RUnlock()
+		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick)
 	}
 }
