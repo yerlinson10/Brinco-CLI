@@ -175,14 +175,16 @@ brinco update help
 
 | Atajo | Equivale a |
 |--------|------------|
+| `brinco host` (sin flags) | Asistente interactivo (mismas preguntas que `room create` sin args) |
 | `brinco host [flags]` | `brinco room create` |
+| `brinco join` (sin args) | Asistente interactivo (`room join` sin args) |
 | `brinco join [CODIGO] [flags]` | `brinco room join` (el codigo puede ir **sin** `--code`) |
 | `brinco join @perfil` | Carga `%APPDATA%` / `~/.config` … `brinco-cli/profiles.json` |
 | `brinco relay --listen ...` | `brinco relay serve` (**serve** es opcional) |
 | `brinco doctor` | Version, rutas de cache, config y perfiles |
 | `--pass` | Mismo valor que `--password` |
 
-Si falta el **codigo** en `join`, se pregunta en consola. Si falta la **password** en relay/direct, se pregunta (se escribe en claro; usa terminal seguro si compartes pantalla).
+Si falta el **codigo** en `join` (modo no asistente), se pregunta en consola. En **relay** y **direct**, `--password` / `--pass` son opcionales: vacio = sala **sin** clave (cualquiera con el codigo entra). La entrada de password en terminal es en claro; evita compartir pantalla si usas clave.
 
 **Perfiles** (archivo `profiles.json` en el directorio de config, ver `brinco doctor`):
 
@@ -206,6 +208,7 @@ Uso: `brinco join @casa` (los flags en linea siguen pudiendo sobreescribir el pe
 
 ## Novedades (funciones recientes)
 
+- **Asistente**: `brinco host`, `brinco join`, `brinco room create` o `brinco room join` sin argumentos adicionales abren un flujo guiado (valores por defecto; Enter en password deja la sala abierta).
 - **Ayuda detallada en CLI**: `brinco help`, `brinco room help`, `brinco relay help`, `brinco update help` describen flags y flujos.
 - **Diagnostico en sala**: `/diag` (estado, relay, NAT estimado; en p2p RTT por peer con ping). `/peers` sigue disponible.
 - **Reconexion**: clientes TCP (`direct` / `relay`) reintentan con backoff tras corte; en p2p hay reintento de enlaces al topic.
@@ -343,7 +346,7 @@ Resumen:
 | `--name` | Nombre visible inicial (default: `host`). El servidor puede renombrar con sufijo `#2` si hay colision. |
 | `--mode` | `p2p` (default) \| `direct` \| `relay` \| `guaranteed` |
 | `--relay` | **p2p**: multiaddr libp2p opcional. **relay**: `host:puerto` del relay TCP (obligatorio). |
-| `--password` | Obligatorio en **direct** y **relay**. No aplica a create **p2p** / **guaranteed**. |
+| `--password` | Opcional en **direct** y **relay** (vacio = sin clave). No aplica a create **p2p** / **guaranteed**. |
 | `--direct` | Atajo: fuerza `--mode direct`. |
 | `--listen` / `--public` | Solo **direct**: escucha y direccion publica (`--public` obligatorio si escuchas en `0.0.0.0`). |
 
@@ -351,10 +354,10 @@ Resumen:
 
 | Flag | Uso |
 |------|-----|
-| `--code` | Codigo de sala (obligatorio). |
+| `--code` | Codigo de sala (obligatorio salvo asistente o prompt interactivo). |
 | `--mode` | `auto` (default): se infiere del prefijo del codigo. |
 | `--name` | Nombre visible (default: `guest`). |
-| `--password` | Obligatorio en **direct** y **relay**. |
+| `--password` | Opcional en **direct** y **relay** (vacio = sin clave). |
 | `--relay` | Opcional solo en **p2p**. |
 
 ### `room code`

@@ -23,6 +23,26 @@ func readPasswordLine(prompt string) (string, error) {
 	return readLineTrim("")
 }
 
+func readLineTrimOrDefault(prompt, defaultVal string) (string, error) {
+	s, err := readLineTrim(prompt)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(s) == "" {
+		return defaultVal, nil
+	}
+	return strings.TrimSpace(s), nil
+}
+
+func readOptionalPasswordLine() (string, error) {
+	fmt.Fprintln(os.Stderr, "Password de la sala (Enter = sin contraseña, la sala queda abierta):")
+	s, err := readLineTrim("")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(s), nil
+}
+
 func looksLikeRoomCode(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" || strings.HasPrefix(s, "@") {

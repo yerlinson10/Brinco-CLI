@@ -20,7 +20,9 @@ const version = "0.2.0"
 const mainHelpText = `Chat P2P / relay / TCP
 
 ATAJOS (lo mas habitual)
+  brinco host                   Asistente interactivo (sin flags)
   brinco host [flags]           Crear sala (equivale a: brinco room create)
+  brinco join                   Asistente interactivo (sin argumentos)
   brinco join [CODIGO] [flags] Unirse (CODIGO posicional opcional si usas --code o perfil)
   brinco relay [--listen ...]   Levantar relay TCP (equivale a: relay serve; "serve" es opcional)
   brinco doctor                 Version, rutas y comprobaciones rapidas
@@ -48,22 +50,26 @@ Logs: %%LOCALAPPDATA%%\brinco-cli\logs\brinco.log (Windows) o cache del sistema.
 const roomHelpText = `brinco room — Salas (y alias brinco host / brinco join)
 
 ATAJOS
+  brinco host                   sin flags: asistente (nombre, modo, relay, password opcional)
   brinco host [mismos flags que room create]
+  brinco join                   sin args: asistente (codigo, nombre, password opcional en TCP)
   brinco join CODIGO [flags]     codigo como primer argumento (sin --code)
   brinco join @perfil [flags]     carga profiles.json (relay, mode, password, code...)
+  brinco room create            sin mas args: mismo asistente que brinco host
+  brinco room join              sin mas args: mismo asistente que brinco join
 
 room create / host
   --name       (default host)
   --mode       p2p | direct | relay | guaranteed (default p2p)
   --relay      p2p: multiaddr libp2p opcional | relay: host:puerto TCP obligatorio
-  --password, --pass   clave de sala (mismo valor). En relay/direct si falta, se pregunta.
+  --password, --pass   clave opcional; vacio = sala abierta (sin clave) en relay/direct
   --direct     atajo a modo direct
   --listen, --public   solo direct
 
 room join / join
-  CODIGO o --code   obligatorio (si falta, se pregunta "Codigo de sala:")
+  CODIGO o --code   obligatorio salvo asistente (Enter reutiliza ultimo codigo guardado)
   --name, --mode, --relay, --password, --pass, --direct   como arriba
-  Si relay/direct requieren password y falta, se pregunta.
+  Password opcional en relay/direct; vacio = sala sin clave
 
 DENTRO DEL CHAT
   @usuario mensaje     privado (atajo de /msg)
@@ -173,25 +179,6 @@ func effectiveJoinMode(mode, code string) string {
 	return "p2p"
 }
 
-func joinNeedsPassword(mode, code string) bool {
-	m := effectiveJoinMode(mode, code)
-	return m == "direct" || m == "relay"
-}
-
-func createNeedsPassword(mode string, direct bool, relay string) bool {
-	if direct {
-		mode = "direct"
-	}
-	switch mode {
-	case "relay", "direct":
-		return true
-	case "guaranteed", "p2p":
-		return false
-	default:
-		return false
-	}
-}
-
 func execRoomCreate(name, mode, relay string, direct bool, listen, public, password string) int {
 	if direct {
 		mode = "direct"
@@ -240,6 +227,9 @@ func execRoomJoin(name, code, mode, relay string, direct bool, password string) 
 }
 
 func runHost(args []string) int {
+	if len(args) == 0 {
+		return runHostGuided()
+	}
 	fs := flag.NewFlagSet("host", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "host", "Nombre de usuario")
@@ -257,18 +247,13 @@ func runHost(args []string) int {
 		*mode = "direct"
 	}
 	pw := mergePass(*password, *pass)
-	if createNeedsPassword(*mode, *direct, *relay) && pw == "" {
-		var err error
-		pw, err = readPasswordLine("Password de la sala: ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
-			return 1
-		}
-	}
 	return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
 }
 
 func runJoinShortcut(args []string) int {
+	if len(args) == 0 {
+		return runJoinGuided()
+	}
 	prof := Profile{}
 	rest := args
 	if len(rest) > 0 && strings.HasPrefix(rest[0], "@") {
@@ -332,15 +317,6 @@ func runJoinShortcut(args []string) int {
 		}
 	}
 
-	if joinNeedsPassword(*mode, code) && strings.TrimSpace(pw) == "" {
-		var err error
-		pw, err = readPasswordLine("Password de la sala: ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
-			return 1
-		}
-	}
-
 	return execRoomJoin(*name, code, *mode, relayVal, *direct, pw)
 }
 
@@ -352,6 +328,9 @@ func runRoom(args []string) int {
 
 	switch args[0] {
 	case "create":
+		if len(args) == 1 {
+			return runHostGuided()
+		}
 		fs := flag.NewFlagSet("room create", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
 		name := fs.String("name", "host", "Nombre de usuario")
@@ -369,17 +348,12 @@ func runRoom(args []string) int {
 			*mode = "direct"
 		}
 		pw := mergePass(*password, *pass)
-		if createNeedsPassword(*mode, *direct, *relay) && pw == "" {
-			var err error
-			pw, err = readPasswordLine("Password de la sala: ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
-				return 1
-			}
-		}
 		return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
 
 	case "join":
+		if len(args) == 1 {
+			return runJoinGuided()
+		}
 		fs := flag.NewFlagSet("room join", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
 		name := fs.String("name", "guest", "Nombre de usuario")
@@ -405,14 +379,6 @@ func runRoom(args []string) int {
 			}
 		}
 		pw := mergePass(*password, *pass)
-		if joinNeedsPassword(*mode, c) && pw == "" {
-			var err error
-			pw, err = readPasswordLine("Password de la sala: ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
-				return 1
-			}
-		}
 		return execRoomJoin(*name, c, *mode, *relay, *direct, pw)
 
 	case "code":

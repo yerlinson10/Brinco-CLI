@@ -92,10 +92,6 @@ type roomServer struct {
 
 func RunCreate(name, listenAddr, publicAddr, password string) int {
 	logx.Info("chat create start", "mode", roomModeDirect, "listen", listenAddr)
-	if strings.TrimSpace(password) == "" {
-		fmt.Fprintln(os.Stderr, "Error: --password es obligatorio para crear sala")
-		return 1
-	}
 	if strings.TrimSpace(name) == "" {
 		name = "host"
 	}
@@ -143,10 +139,6 @@ func RunJoin(name, code, password string) int {
 	logx.Info("chat join start")
 	if strings.TrimSpace(code) == "" {
 		fmt.Fprintln(os.Stderr, "Error: --code es obligatorio")
-		return 1
-	}
-	if strings.TrimSpace(password) == "" {
-		fmt.Fprintln(os.Stderr, "Error: --password es obligatorio")
 		return 1
 	}
 	if strings.TrimSpace(name) == "" {

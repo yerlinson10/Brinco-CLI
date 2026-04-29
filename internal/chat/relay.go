@@ -40,10 +40,6 @@ func RunCreateUsingRelayWithProtocol(name, relayAddr, password, protocol string)
 		fmt.Fprintln(os.Stderr, "Error: --relay es obligatorio en modo relay")
 		return 1
 	}
-	if strings.TrimSpace(password) == "" {
-		fmt.Fprintln(os.Stderr, "Error: --password es obligatorio para crear sala")
-		return 1
-	}
 	if strings.TrimSpace(name) == "" {
 		name = "host"
 	}
@@ -217,9 +213,6 @@ cleanup:
 }
 
 func (h *relayHub) createRoom(password string) (*relayRoom, error) {
-	if strings.TrimSpace(password) == "" {
-		return nil, fmt.Errorf("password obligatoria")
-	}
 	roomID, err := randomID(8)
 	if err != nil {
 		return nil, err
