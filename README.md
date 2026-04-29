@@ -107,7 +107,9 @@ sudo rpm -i brinco-*.rpm
 - [Inicio rapido](#inicio-rapido)
 - [Modos de conexion](#modos-de-conexion)
 - [Referencia de comandos](#referencia-de-comandos)
+- [Actualizacion del binario](#actualizacion-del-binario)
 - [Comandos dentro del chat](#comandos-dentro-del-chat)
+- [Pruebas E2E](#pruebas-e2e)
 - [Logs](#logs)
 - [Arquitectura interna](#arquitectura-interna)
 - [Solucion de problemas](#solucion-de-problemas)
@@ -123,6 +125,9 @@ sudo rpm -i brinco-*.rpm
 - **Colores por usuario** — cada persona tiene un color distinto en la terminal.
 - **Logs persistentes** — registro en archivo con nivel configurable.
 - **Sin configuracion obligatoria** — los modos `p2p` y `guaranteed` funcionan solos.
+- **Diagnostico y estado** — `/diag`, reconexion y mensajes de estado en consola donde aplica.
+- **Chat enriquecido** — privados, reacciones, archivos pequenos, rate limiting basico.
+- **Actualizador** — comprobacion y descarga de nuevas versiones desde releases publicados.
 
 ---
 
@@ -158,7 +163,25 @@ O ejecutar directamente sin compilar:
 
 ```bash
 go run ./cmd/brinco help
+brinco room help
+brinco relay help
+brinco update help
 ```
+
+---
+
+## Novedades (funciones recientes)
+
+- **Ayuda detallada en CLI**: `brinco help`, `brinco room help`, `brinco relay help`, `brinco update help` describen flags y flujos.
+- **Diagnostico en sala**: `/diag` (estado, relay, NAT estimado; en p2p RTT por peer con ping). `/peers` sigue disponible.
+- **Reconexion**: clientes TCP (`direct` / `relay`) reintentan con backoff tras corte; en p2p hay reintento de enlaces al topic.
+- **Mensajes privados**: `/msg <nombre_en_sala> texto` — solo remitente y destinatario. Tras entrar veras **Tu nombre:** (nombre real asignado por el servidor si hubo colision, ej. `ana#2`).
+- **Reacciones**: linea sola `+1`, `-1`, `ok` o `:emoji:` (sin `/`). Otras lineas como `+2` son chat normal.
+- **Archivos**: `/send ruta` (~1.5 MB). El receptor guarda el archivo en **Descargas** (o directorio actual) y se muestra la ruta.
+- **Anti-spam**: limite de mensajes por conexion (relay/direct) y por nick en recepcion p2p.
+- **p2p**: cifrado de payload de aplicacion derivado del codigo de sala; huella por nick (TOFU); mensajes `system` sin cifrar.
+- **Actualizador**: `brinco update check` / `brinco update apply` contra GitHub Releases (ver `brinco update help`).
+- **Pruebas E2E**: `go test ./internal/e2e -v` (flujos relay y TCP directo entre procesos).
 
 ---
 
@@ -268,31 +291,41 @@ go run ./cmd/brinco room join --name Luis --code direct-... --password clave123
 
 ## Referencia de comandos
 
+La referencia completa y los matices de cada flag estan en la propia CLI:
+
+```bash
+brinco help
+brinco room help
+brinco relay help
+brinco update help
+```
+
+Resumen:
+
 ### `room create`
 
-```
---name      Nombre de usuario (default: host)
---mode      p2p | direct | relay | guaranteed  (default: p2p)
---relay     [p2p] Multiaddr relay libp2p propio (opcional)
-            [relay] IP:PUERTO del relay TCP
---listen    [direct] Direccion local a escuchar (default: 0.0.0.0:9090)
---public    [direct] IP:PUERTO publico del host
---password  [direct|relay] Password de la sala
-```
+| Flag | Uso |
+|------|-----|
+| `--name` | Nombre visible inicial (default: `host`). El servidor puede renombrar con sufijo `#2` si hay colision. |
+| `--mode` | `p2p` (default) \| `direct` \| `relay` \| `guaranteed` |
+| `--relay` | **p2p**: multiaddr libp2p opcional. **relay**: `host:puerto` del relay TCP (obligatorio). |
+| `--password` | Obligatorio en **direct** y **relay**. No aplica a create **p2p** / **guaranteed**. |
+| `--direct` | Atajo: fuerza `--mode direct`. |
+| `--listen` / `--public` | Solo **direct**: escucha y direccion publica (`--public` obligatorio si escuchas en `0.0.0.0`). |
 
 ### `room join`
 
-```
---name      Nombre de usuario (default: guest)
---code      Codigo de sala (obligatorio)
---mode      auto | p2p | direct | relay | guaranteed  (default: auto)
---relay     [p2p] Relay libp2p adicional (opcional)
---password  [direct|relay] Password de la sala
-```
+| Flag | Uso |
+|------|-----|
+| `--code` | Codigo de sala (obligatorio). |
+| `--mode` | `auto` (default): se infiere del prefijo del codigo. |
+| `--name` | Nombre visible (default: `guest`). |
+| `--password` | Obligatorio en **direct** y **relay**. |
+| `--relay` | Opcional solo en **p2p**. |
 
 ### `room code`
 
-Muestra el ultimo codigo de sala generado en esta maquina.
+Muestra el ultimo codigo de sala guardado en disco (ultimo create p2p o ultimo codigo TCP/relay).
 
 ```bash
 go run ./cmd/brinco room code
@@ -300,25 +333,51 @@ go run ./cmd/brinco room code
 
 ### `relay serve`
 
-Levanta un servidor relay TCP para el modo `relay`.
+Relay TCP para el modo `room` **relay**. Flags: `--listen`, `--public` (ver `brinco relay help`).
 
+---
+
+## Actualizacion del binario
+
+Comandos (requieren salida a Internet hacia la API y releases de GitHub):
+
+```bash
+brinco update help      # Detalle
+brinco update check     # Compara version local vs ultima release
+brinco update apply     # Descarga artefacto para tu OS/CPU y aplica (ver mensajes en consola)
 ```
---listen    Direccion local (ej: 0.0.0.0:10000)
---public    IP:PUERTO publico accesible por otros
-```
+
+En **Windows** el binario en uso puede quedar bloqueado: el updater puede dejar un `.exe.new` para sustituir manualmente tras cerrar el proceso.
 
 ---
 
 ## Comandos dentro del chat
 
-Una vez dentro de una sala, puedes usar estos comandos:
+Aplica a las sesiones interactivas (p2p, guaranteed, relay, direct). Los prefijos `/` son comandos; el resto se envia como mensaje de chat.
 
-| Comando | Descripcion |
+| Entrada | Descripcion |
 |---------|-------------|
 | `/code` | Muestra el codigo de sala actual |
-| `/peers` | Cantidad de peers enlazados (modos p2p/guaranteed) |
-| `/quit` | Salir del chat |
-| `/help` | Lista de comandos disponibles |
+| `/peers` | En TCP: pide lista de nombres en sala. En p2p: muestra cantidad de peers en el topic |
+| `/diag` | Diagnostico: estado, relay/NAT donde aplica; en p2p incluye RTT por peer |
+| `/msg USER TEXTO` | Privado solo entre tu nick de sala y `USER` (usa el nombre exacto, ver linea **Tu nombre:** al entrar) |
+| `/send RUTA` | Archivo pequeno (orden ~1.5 MB). El receptor lo guarda y se imprime la ruta |
+| `/quit` | Salir |
+| `/help` | Ayuda resumida (la ayuda completa de flags esta en `brinco room help`) |
+
+**Reacciones** (sin `/`, una sola linea): `+1`, `-1`, `ok`, `:emoji:`. Cualquier otra linea (por ejemplo `+2`) es un mensaje de chat normal.
+
+---
+
+## Pruebas E2E
+
+Pruebas de integracion que levantan `go run ./cmd/brinco` en procesos separados (desde la raiz del repo):
+
+```bash
+go test ./internal/e2e -v
+```
+
+Incluye flujos **direct** (TCP) y **relay** con puerto libre. Para toda la suite: `go test ./...`.
 
 ---
 
@@ -351,14 +410,16 @@ Niveles disponibles: `debug` · `info` · `warn` · `error`
 ```
 cmd/brinco/main.go          Punto de entrada
 internal/
-  cli/cli.go                Parser de comandos y flags, routing de modos
+  cli/cli.go                Parser de comandos, ayuda y flags
   p2p/
-    node.go                 Nodo libp2p, GossipSub, mDNS, relay circuit v2
+    node.go                 Nodo libp2p, GossipSub, chat, cifrado app-level, diag, reconexion
     commands.go             RunCreate / RunJoin / RunCreateGuaranteed / RunJoinGuaranteed
     store.go                Persistencia del ultimo codigo de sala
   chat/
-    chat.go                 Chat TCP directo, parseo de codigos direct/relay
-    relay.go                Servidor relay TCP y cliente relay
+    chat.go                 Chat TCP directo, servidor de sala, cliente, privados, archivos
+    relay.go                Servidor relay TCP, salas, cliente relay
+  e2e/                      Tests end-to-end entre procesos (go test ./internal/e2e)
+  updater/updater.go        Comprobacion y descarga de releases GitHub
   roomproto/roomproto.go    Prefijos de protocolo en codigos de sala
   logx/logx.go              Sistema de logs con niveles y archivo
 ```
@@ -387,6 +448,12 @@ Soluciones en orden de simplicidad:
 1. Esperar 10-15 segundos, libp2p intenta hole-punching en segundo plano.
 2. Cambiar a modo `guaranteed` — usa relay IPFS automatico, no requiere puertos abiertos.
 3. Levantar un relay propio con `relay serve` y usar modo `relay`.
+
+### Los mensajes privados (`/msg`) no llegan o los ve otra persona
+
+- Usa el **nombre exacto** que muestra la linea **Tu nombre:** al entrar (puede ser `ana#2` y no `ana`).
+- Tras actualizar el codigo, **reinicia** el proceso `relay serve` y vuelve a abrir las sesiones `room join` / `room create`.
+- Si un tercero aun viera texto privado, actualiza el binario: el cliente ignora privados que no van dirigidos a el cuando ya recibio su nombre asignado.
 
 ### Password incorrecta al unirse
 
