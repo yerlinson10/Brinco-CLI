@@ -2,9 +2,9 @@ package p2p
 
 import (
 	"bufio"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -25,9 +25,9 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -87,7 +87,7 @@ type Node struct {
 }
 
 var (
-	nickColorCodesP2P   = []string{
+	nickColorCodesP2P = []string{
 		"38;5;220", "38;5;226", "38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
 		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
 		"38;5;190", "38;5;214", "38;5;208", "38;5;202",
@@ -500,7 +500,12 @@ func (n *Node) RunChat(roomCode string) int {
 				printRateLimitLocalP2P()
 				continue
 			}
-			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			if err := n.publishMessage(reactionMsg); err != nil {
+				fmt.Fprintf(os.Stderr, "Error enviando reaccion: %v\n", err)
+			} else {
+				renderMessage(reactionMsg, n.name)
+			}
 			continue
 		}
 
@@ -509,7 +514,12 @@ func (n *Node) RunChat(roomCode string) int {
 				printRateLimitLocalP2P()
 				continue
 			}
-			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			if err := n.publishMessage(pmMsg); err != nil {
+				fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
+			} else {
+				renderMessage(pmMsg, n.name)
+			}
 			continue
 		}
 
@@ -540,8 +550,11 @@ func (n *Node) RunChat(roomCode string) int {
 					printRateLimitLocalP2P()
 					continue
 				}
-				if err := n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}); err != nil {
+				pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+				if err := n.publishMessage(pmMsg); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
+				} else {
+					renderMessage(pmMsg, n.name)
 				}
 			case strings.HasPrefix(line, "/send "):
 				if !allowLocalP2P(localLimiter) {
@@ -731,11 +744,11 @@ func displayNickP2P(nick, myNick string) string {
 	if n == "" {
 		return colorizeName(nick)
 	}
-	label := n
+	label := colorizeName(n)
 	if n == strings.TrimSpace(myNick) {
-		label = n + " (tu)"
+		return label + " (tu)"
 	}
-	return colorizeName(label)
+	return label
 }
 
 func clearConsoleP2P() {
@@ -948,7 +961,7 @@ func (n *Node) sendFile(path string) error {
 	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
 		name = path[idx+1:]
 	}
-	return n.publishMessage(chatMessage{
+	msg := chatMessage{
 		ID:          newMessageID(),
 		From:        n.name,
 		Type:        "file",
@@ -956,7 +969,13 @@ func (n *Node) sendFile(path string) error {
 		FileName:    name,
 		FilePayload: base64.StdEncoding.EncodeToString(raw),
 		Fingerprint: n.fingerprint(),
-	})
+	}
+	if err := n.publishMessage(msg); err != nil {
+		return err
+	}
+	t := time.Unix(msg.At, 0).Format("15:04:05")
+	fmt.Printf("[%s] %s envio archivo %s (%d bytes)\n", t, displayNickP2P(msg.From, n.name), msg.FileName, len(raw))
+	return nil
 }
 
 func saveIncomingP2PFile(msg chatMessage) (string, int, error) {

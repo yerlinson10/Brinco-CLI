@@ -23,22 +23,22 @@ import (
 )
 
 const (
-	msgTypeCreate   = "create"
-	msgTypeJoin     = "join"
-	msgTypeWelcome  = "welcome"
-	msgTypeChat     = "chat"
-	msgTypeSystem   = "system"
-	msgTypeError    = "error"
-	msgTypePeersReq = "peers_req"
-	msgTypePeers    = "peers"
-	msgTypeQuit     = "quit"
-	msgTypePrivate  = "private"
-	msgTypeReaction = "reaction"
-	msgTypeFile     = "file"
-	msgTypeDiagReq  = "diag_req"
-	msgTypeDiag        = "diag"
-	msgTypeModCmd      = "mod_cmd"
-	msgTypeHostUpdate  = "host_update"
+	msgTypeCreate     = "create"
+	msgTypeJoin       = "join"
+	msgTypeWelcome    = "welcome"
+	msgTypeChat       = "chat"
+	msgTypeSystem     = "system"
+	msgTypeError      = "error"
+	msgTypePeersReq   = "peers_req"
+	msgTypePeers      = "peers"
+	msgTypeQuit       = "quit"
+	msgTypePrivate    = "private"
+	msgTypeReaction   = "reaction"
+	msgTypeFile       = "file"
+	msgTypeDiagReq    = "diag_req"
+	msgTypeDiag       = "diag"
+	msgTypeModCmd     = "mod_cmd"
+	msgTypeHostUpdate = "host_update"
 
 	roomModeDirect     = "direct"
 	roomModeRelay      = "relay"
@@ -51,7 +51,7 @@ const (
 )
 
 var (
-	nickColorCodes   = []string{
+	nickColorCodes = []string{
 		"38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
 		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
 		"38;5;190", "38;5;226", "38;5;214", "38;5;208", "38;5;202",
@@ -1051,15 +1051,13 @@ func displayNick(nick, myNick, roomHost string) string {
 	if n == "" {
 		return colorizeName(nick)
 	}
-	label := n
 	if n == strings.TrimSpace(myNick) {
-		label = n + " (tu)"
+		return colorizeName(n) + " (tu)"
 	}
-	base := nickBaseForPalette(label)
-	if rh := strings.TrimSpace(roomHost); rh != "" && strings.EqualFold(base, rh) {
-		return colorizeFixed(label, hostNickANSI)
+	if rh := strings.TrimSpace(roomHost); rh != "" && strings.EqualFold(n, rh) {
+		return colorizeFixed(n, hostNickANSI)
 	}
-	return colorizeName(label)
+	return colorizeName(n)
 }
 
 func nickBaseForPalette(displayed string) string {
@@ -1090,7 +1088,7 @@ func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
 		return false
 	}
 	switch msg.Type {
-	case msgTypeChat, msgTypePrivate, msgTypeReaction, msgTypeFile:
+	case msgTypeChat:
 		return true
 	default:
 		return false
