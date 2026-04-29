@@ -15,9 +15,9 @@ chatear sin servidor central.
 Pasos minimos para usarlo:
 1. Tener el ejecutable `brinco` (o `brinco.exe`) compilado.
 2. Abrir una terminal.
-3. Crear sala: `brinco room create --mode guaranteed --name Ana`.
+3. Crear sala: `brinco host --mode guaranteed --name Ana` (o `brinco room create ...`).
 4. Compartir el codigo generado.
-5. El otro usuario se une: `brinco room join --name Luis --code CODIGO`.
+5. El otro usuario se une: `brinco join CODIGO --name Luis` (o `brinco room join --code CODIGO ...`).
 
 ## Uso con binario compilado (sin go run)
 
@@ -98,6 +98,7 @@ sudo rpm -i brinco-*.rpm
 
 ## Tabla de contenidos
 
+- [Atajos de UX](#atajos-de-ux-memorizar-menos)
 - [Que hace Brinco y que debes hacer primero](#que-hace-brinco-y-que-debes-hacer-primero)
 - [Uso con binario compilado (sin go run)](#uso-con-binario-compilado-sin-go-run)
 - [Instalacion por gestores y paquetes](#instalacion-por-gestores-y-paquetes)
@@ -167,6 +168,39 @@ brinco room help
 brinco relay help
 brinco update help
 ```
+
+---
+
+## Atajos de UX (memorizar menos)
+
+| Atajo | Equivale a |
+|--------|------------|
+| `brinco host [flags]` | `brinco room create` |
+| `brinco join [CODIGO] [flags]` | `brinco room join` (el codigo puede ir **sin** `--code`) |
+| `brinco join @perfil` | Carga `%APPDATA%` / `~/.config` … `brinco-cli/profiles.json` |
+| `brinco relay --listen ...` | `brinco relay serve` (**serve** es opcional) |
+| `brinco doctor` | Version, rutas de cache, config y perfiles |
+| `--pass` | Mismo valor que `--password` |
+
+Si falta el **codigo** en `join`, se pregunta en consola. Si falta la **password** en relay/direct, se pregunta (se escribe en claro; usa terminal seguro si compartes pantalla).
+
+**Perfiles** (archivo `profiles.json` en el directorio de config, ver `brinco doctor`):
+
+```json
+{
+  "casa": {
+    "mode": "relay",
+    "relay": "127.0.0.1:10000",
+    "password": "demo",
+    "code": "relay-REEMPLAZA_CON_TU_CODIGO",
+    "name": "yo"
+  }
+}
+```
+
+Uso: `brinco join @casa` (los flags en linea siguen pudiendo sobreescribir el perfil).
+
+**Privado rapido en sala**: `@usuario texto` (ademas de `/msg usuario texto`).
 
 ---
 

@@ -399,7 +399,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -437,6 +437,11 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			continue
 		}
 
+		if to, txt, ok := parseAtMention(line); ok {
+			_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
 			switch line {
 			case "/quit":
@@ -453,7 +458,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
 			default:
 				if strings.HasPrefix(line, "/msg ") {
 					to, text, ok := parsePrivateCommand(line)

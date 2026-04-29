@@ -585,7 +585,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -615,6 +615,11 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			continue
 		}
 
+		if to, txt, ok := parseAtMention(line); ok {
+			_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
 			switch line {
 			case "/quit":
@@ -631,7 +636,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u t | /send archivo /quit /help")
 			default:
 				if strings.HasPrefix(line, "/msg ") {
 					to, text, ok := parsePrivateCommand(line)
@@ -774,6 +779,24 @@ func renderWireMessage(msg wireMessage, myNick string) {
 			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, colorizeName(msg.From), msg.FileName, size, path)
 		}
 	}
+}
+
+func parseAtMention(line string) (to, text string, ok bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "@") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(line[1:])
+	idx := strings.IndexByte(rest, ' ')
+	if idx < 0 {
+		return "", "", false
+	}
+	user := strings.TrimSpace(rest[:idx])
+	msg := strings.TrimSpace(rest[idx+1:])
+	if user == "" || msg == "" {
+		return "", "", false
+	}
+	return user, msg, true
 }
 
 func parsePrivateCommand(line string) (string, string, bool) {

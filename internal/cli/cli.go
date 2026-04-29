@@ -4,6 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 
 	"brinco-cli/internal/chat"
 	"brinco-cli/internal/logx"
@@ -14,120 +17,75 @@ import (
 
 const version = "0.2.0"
 
-const mainHelpText = `brinco-cli v%s - Chat P2P / relay / TCP desde consola
+const mainHelpText = `Chat P2P / relay / TCP
 
-USO GENERAL
-  brinco <comando> [argumentos]
-  brinco help              Esta ayuda
-  brinco version           Version del binario
+ATAJOS (lo mas habitual)
+  brinco host [flags]           Crear sala (equivale a: brinco room create)
+  brinco join [CODIGO] [flags] Unirse (CODIGO posicional opcional si usas --code o perfil)
+  brinco relay [--listen ...]   Levantar relay TCP (equivale a: relay serve; "serve" es opcional)
+  brinco doctor                 Version, rutas y comprobaciones rapidas
 
-COMANDOS PRINCIPALES
-  room create|join|code    Salas de chat (ver: brinco room help)
-  relay serve              Relay TCP propio para modo relay (ver: brinco relay help)
-  update check|apply       Actualizacion desde GitHub Releases (ver: brinco update help)
+COMANDOS CLASICOS
+  brinco room create|join|code
+  brinco relay serve ...
+  brinco update check|apply
+  brinco version
 
-CODIGOS DE SALA (prefijo = protocolo)
-  p2p-...         libp2p + GossipSub (relay libp2p opcional con --relay)
-  guaranteed-...  libp2p con relay automatico via red IPFS
-  relay-...       Cliente TCP hacia tu relay (brinco relay serve)
-  direct-...      TCP directo entre host y clientes
+AYUDA DETALLADA
+  brinco help
+  brinco room help
+  brinco relay help
+  brinco update help
 
-LOGS
-  Archivo bajo el directorio de cache del usuario, p. ej. Windows:
-  %%LOCALAPPDATA%%\brinco-cli\logs\brinco.log
-  Nivel: variable de entorno BRINCO_LOG_LEVEL (debug|info|warn|error)
+Perfiles locales: %%CONFIG%%/brinco-cli/profiles.json
+  Ejemplo clave "casa": {"relay":"127.0.0.1:10000","mode":"relay","password":"demo","code":"relay-..."}
+  Uso: brinco join @casa
 
-Mas detalle: brinco room help | brinco relay help | brinco update help
+CODIGOS: p2p- | guaranteed- | relay- | direct-
+Logs: %%LOCALAPPDATA%%\brinco-cli\logs\brinco.log (Windows) o cache del sistema.
 `
 
-const roomHelpText = `brinco room — Salas de chat
+const roomHelpText = `brinco room — Salas (y alias brinco host / brinco join)
 
-USO
-  brinco room create [flags]
-  brinco room join   [flags]
-  brinco room code
+ATAJOS
+  brinco host [mismos flags que room create]
+  brinco join CODIGO [flags]     codigo como primer argumento (sin --code)
+  brinco join @perfil [flags]     carga profiles.json (relay, mode, password, code...)
 
-SUBCOMANDOS
-  create   Crea sala y entra al chat interactivo
-  join     Entra con --code <codigo>
-  code     Imprime el ultimo codigo guardado en disco (p2p o chat TCP)
+room create / host
+  --name       (default host)
+  --mode       p2p | direct | relay | guaranteed (default p2p)
+  --relay      p2p: multiaddr libp2p opcional | relay: host:puerto TCP obligatorio
+  --password, --pass   clave de sala (mismo valor). En relay/direct si falta, se pregunta.
+  --direct     atajo a modo direct
+  --listen, --public   solo direct
 
---- room create ---
+room join / join
+  CODIGO o --code   obligatorio (si falta, se pregunta "Codigo de sala:")
+  --name, --mode, --relay, --password, --pass, --direct   como arriba
+  Si relay/direct requieren password y falta, se pregunta.
 
-FLAGS
-  --name string       Nombre visible inicial (default: host). El servidor puede asignar
-                      un sufijo (#2) si el nombre ya existe (modo relay/direct).
-  --mode string       p2p | direct | relay | guaranteed (default: p2p)
-  --relay string      p2p: multiaddr relay libp2p opcional, ej. /ip4/HOST/tcp/PORT/p2p/PEERID
-                      relay: host:puerto del relay TCP (obligatorio en --mode relay)
-  --password string   Obligatorio en direct y relay. No se usa en create p2p/guaranteed.
-  --direct            Atajo: equivale a --mode direct
-  --listen string     Solo direct: escucha local (default: 0.0.0.0:9090)
-  --public string     Solo direct: host:puerto que veran los demas (obligatorio si listen es 0.0.0.0)
-
-NOTAS
-  Modo direct con --relay: crea sala usando relay TCP (caso avanzado).
-  Modo guaranteed: sin relay manual; espera direccion relay en la red IPFS.
-
---- room join ---
-
-FLAGS
-  --name string       Nombre visible (default: guest)
-  --code string       Codigo de sala (obligatorio)
-  --mode string       auto | p2p | direct | relay | guaranteed (default: auto)
-                      auto: el prefijo del codigo fija el modo (p2p-, relay-, etc.)
-  --relay string      Solo p2p: relay libp2p extra opcional
-  --password string   Obligatorio en direct y relay (misma clave que el host)
-  --direct            Atajo: --mode direct
-
---- Dentro del chat (todos los modos salvo detalles solo p2p) ---
-
-  /code              Muestra el codigo de la sala
-  /peers             Lista peers (TCP) o cuenta en topic (p2p)
-  /diag              Diagnostico: estado, relay, NAT estimado; en p2p incluye RTT por peer
-  /msg USER TEXTO    Mensaje privado solo para USER (nombre exacto en sala, ver "Tu nombre:")
-  /send RUTA         Archivo pequeno (limite ~1.5 MB). El receptor lo guarda en Descargas
-  /quit              Salir
-  /help              Esta lista
-
-  Reacciones (linea sola, sin /): +1  -1  ok  :emoji:
-  Cualquier otra linea se envia como mensaje de chat.
-
-SEGURIDAD / RED (resumen)
-  relay/direct: anti-flood por conexion en el servidor; privados solo remitente y destinatario.
-  p2p: mensajes de aplicacion cifrados con clave derivada del codigo de sala; huella TOFU por nick;
-       rate limit por remitente en recepcion.
+DENTRO DEL CHAT
+  @usuario mensaje     privado (atajo de /msg)
+  /msg usuario texto   privado
+  /send ruta           archivo (~1.5 MB)
+  /diag /peers /code /quit /help
+  Reacciones en linea sola: +1  -1  ok  :emoji:
 `
 
-const relayHelpText = `brinco relay — Relay TCP propio (modo room relay)
+const relayHelpText = `brinco relay — Servidor TCP para modo relay
 
-USO
-  brinco relay serve [flags]
+Formas equivalentes:
+  brinco relay serve --listen 0.0.0.0:10000 --public IP:10000
+  brinco relay --listen 0.0.0.0:10000 --public IP:10000
 
 FLAGS
-  --listen string    Direccion local a escuchar (default: 0.0.0.0:10000)
-  --public string    host:puerto publico que recibiran los clientes (obligatorio si listen es 0.0.0.0)
-
-FLUJO TIPICO
-  1) En la maquina publica: brinco relay serve --listen 0.0.0.0:10000 --public TU_IP:10000
-  2) Creador: brinco room create --mode relay --relay TU_IP:10000 --password CLAVE --name host
-  3) Invitados: brinco room join --code relay-... --password CLAVE --name invitado
-
-El relay propio es opcional para p2p/guaranteed (ahi se usa la red libp2p/IPFS).
+  --listen   local (default 0.0.0.0:10000)
+  --public   host:puerto publico (obligatorio si escuchas en 0.0.0.0)
 `
 
-const updateHelpText = `brinco update — Actualizador (GitHub Releases: yerlinson10/Brinco-CLI)
-
-USO
-  brinco update check     Compara version local con la ultima release en GitHub
-  brinco update apply     Descarga el zip/tar.gz para tu GOOS/GOARCH, verifica checksums.txt
-                          si esta publicado, y reemplaza el binario (Unix) o deja .exe.new (Windows)
-
-REQUISITOS
-  Salida a Internet para api.github.com y descarga de assets.
-
-NOTA
-  La version embebida en el CLI es la constante interna; alinear tags de release con releases reales.
+const updateHelpText = `brinco update — GitHub Releases (yerlinson10/Brinco-CLI)
+  brinco update check | apply | help
 `
 
 func Run(args []string) int {
@@ -144,6 +102,12 @@ func Run(args []string) int {
 	case "version", "-v", "--version":
 		fmt.Printf("brinco-cli %s\n", version)
 		return 0
+	case "doctor":
+		return runDoctor()
+	case "host":
+		return runHost(args[1:])
+	case "join":
+		return runJoinShortcut(args[1:])
 	case "relay":
 		return runRelay(args[1:])
 	case "update":
@@ -155,6 +119,229 @@ func Run(args []string) int {
 		printMainHelp()
 		return 1
 	}
+}
+
+func printMainHelp() {
+	fmt.Printf("brinco-cli %s\n\n", version)
+	s := mainHelpText
+	if cfg, err := os.UserConfigDir(); err == nil {
+		s = strings.ReplaceAll(s, "%%CONFIG%%", cfg)
+	} else {
+		s = strings.ReplaceAll(s, "%%CONFIG%%", "(config)")
+	}
+	fmt.Print(s)
+}
+
+func runDoctor() int {
+	fmt.Printf("brinco-cli %s\n", version)
+	fmt.Printf("go %s  %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if wd, err := os.Getwd(); err == nil {
+		fmt.Printf("cwd: %s\n", wd)
+	}
+	if d, err := os.UserCacheDir(); err == nil {
+		fmt.Printf("cache: %s\n", filepath.Join(d, "brinco-cli"))
+	}
+	if d, err := profilesDir(); err == nil {
+		fmt.Printf("config: %s\n", d)
+	}
+	if p, err := profilesPath(); err == nil {
+		if _, err := os.Stat(p); err == nil {
+			fmt.Printf("profiles: %s (existe)\n", p)
+		} else {
+			fmt.Printf("profiles: %s (aun no existe; opcional)\n", p)
+		}
+	}
+	return 0
+}
+
+func mergePass(a, b string) string {
+	b = strings.TrimSpace(b)
+	if b != "" {
+		return b
+	}
+	return strings.TrimSpace(a)
+}
+
+func effectiveJoinMode(mode, code string) string {
+	if mode != "auto" {
+		return mode
+	}
+	p, _ := roomproto.Unwrap(code)
+	if p != "" {
+		return p
+	}
+	return "p2p"
+}
+
+func joinNeedsPassword(mode, code string) bool {
+	m := effectiveJoinMode(mode, code)
+	return m == "direct" || m == "relay"
+}
+
+func createNeedsPassword(mode string, direct bool, relay string) bool {
+	if direct {
+		mode = "direct"
+	}
+	switch mode {
+	case "relay", "direct":
+		return true
+	case "guaranteed", "p2p":
+		return false
+	default:
+		return false
+	}
+}
+
+func execRoomCreate(name, mode, relay string, direct bool, listen, public, password string) int {
+	if direct {
+		mode = "direct"
+	}
+	switch mode {
+	case "direct":
+		if relay != "" {
+			return chat.RunCreateUsingRelay(name, relay, password)
+		}
+		return chat.RunCreate(name, listen, public, password)
+	case "relay":
+		return chat.RunCreateUsingRelayWithProtocol(name, relay, password, roomproto.ProtocolRelay)
+	case "guaranteed":
+		return p2pcmd.RunCreateGuaranteed(name)
+	case "p2p":
+		return p2pcmd.RunCreate(name, relay)
+	default:
+		fmt.Fprintf(os.Stderr, "Modo no soportado: %s\n", mode)
+		return 1
+	}
+}
+
+func execRoomJoin(name, code, mode, relay string, direct bool, password string) int {
+	if direct {
+		mode = "direct"
+	}
+	if mode == "auto" {
+		p, _ := roomproto.Unwrap(code)
+		if p != "" {
+			mode = p
+		} else {
+			mode = "p2p"
+		}
+	}
+	switch mode {
+	case "p2p":
+		return p2pcmd.RunJoin(name, code, relay)
+	case "direct", "relay":
+		return chat.RunJoin(name, code, password)
+	case "guaranteed":
+		return p2pcmd.RunJoinGuaranteed(name, code)
+	default:
+		fmt.Fprintf(os.Stderr, "Modo no soportado: %s\n", mode)
+		return 1
+	}
+}
+
+func runHost(args []string) int {
+	fs := flag.NewFlagSet("host", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "host", "Nombre de usuario")
+	mode := fs.String("mode", "p2p", "Modo: p2p | direct | relay | guaranteed")
+	relay := fs.String("relay", "", "Relay segun modo")
+	direct := fs.Bool("direct", false, "Modo TCP directo")
+	listen := fs.String("listen", "0.0.0.0:9090", "[direct] Escucha local")
+	public := fs.String("public", "", "[direct] Host:puerto publico")
+	password := fs.String("password", "", "Password de la sala")
+	pass := fs.String("pass", "", "Alias de --password")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *direct {
+		*mode = "direct"
+	}
+	pw := mergePass(*password, *pass)
+	if createNeedsPassword(*mode, *direct, *relay) && pw == "" {
+		var err error
+		pw, err = readPasswordLine("Password de la sala: ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
+			return 1
+		}
+	}
+	return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
+}
+
+func runJoinShortcut(args []string) int {
+	prof := Profile{}
+	rest := args
+	if len(rest) > 0 && strings.HasPrefix(rest[0], "@") {
+		pn := strings.TrimPrefix(rest[0], "@")
+		if !looksLikeRoomCode(rest[0]) {
+			var err error
+			prof, err = loadProfile(pn)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				return 1
+			}
+			rest = rest[1:]
+		}
+	}
+
+	code := strings.TrimSpace(prof.Code)
+	if len(rest) > 0 && looksLikeRoomCode(rest[0]) {
+		code = rest[0]
+		rest = rest[1:]
+	}
+
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "guest", "Nombre")
+	codeFlag := fs.String("code", "", "Codigo de sala")
+	mode := fs.String("mode", "auto", "Modo")
+	relay := fs.String("relay", "", "Relay libp2p (p2p)")
+	direct := fs.Bool("direct", false, "Modo TCP directo")
+	password := fs.String("password", "", "Password")
+	pass := fs.String("pass", "", "Alias de --password")
+	if err := fs.Parse(rest); err != nil {
+		return 1
+	}
+	if *direct {
+		*mode = "direct"
+	}
+	if strings.TrimSpace(*codeFlag) != "" {
+		code = *codeFlag
+	}
+	if strings.TrimSpace(prof.Name) != "" && *name == "guest" {
+		*name = prof.Name
+	}
+	if prof.Mode != "" && *mode == "auto" {
+		*mode = prof.Mode
+	}
+	relayVal := *relay
+	if strings.TrimSpace(prof.Relay) != "" && relayVal == "" {
+		relayVal = prof.Relay
+	}
+	pw := mergePass(*password, *pass)
+	if strings.TrimSpace(prof.Password) != "" && pw == "" {
+		pw = prof.Password
+	}
+
+	if strings.TrimSpace(code) == "" {
+		var err error
+		code, err = readLineTrim("Codigo de sala: ")
+		if err != nil || strings.TrimSpace(code) == "" {
+			fmt.Fprintln(os.Stderr, "Error: codigo de sala obligatorio")
+			return 1
+		}
+	}
+
+	if joinNeedsPassword(*mode, code) && strings.TrimSpace(pw) == "" {
+		var err error
+		pw, err = readPasswordLine("Password de la sala: ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
+			return 1
+		}
+	}
+
+	return execRoomJoin(*name, code, *mode, relayVal, *direct, pw)
 }
 
 func runRoom(args []string) int {
@@ -173,30 +360,24 @@ func runRoom(args []string) int {
 		direct := fs.Bool("direct", false, "Modo TCP directo (requiere IP publica)")
 		listen := fs.String("listen", "0.0.0.0:9090", "[--direct] Direccion local")
 		public := fs.String("public", "", "[--direct] Direccion publica host:puerto")
-		password := fs.String("password", "", "[direct|relay|guaranteed] Password de la sala")
+		password := fs.String("password", "", "Password de la sala")
+		pass := fs.String("pass", "", "Alias de --password")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
 		if *direct {
 			*mode = "direct"
 		}
-
-		switch *mode {
-		case "direct":
-			if *relay != "" {
-				return chat.RunCreateUsingRelay(*name, *relay, *password)
+		pw := mergePass(*password, *pass)
+		if createNeedsPassword(*mode, *direct, *relay) && pw == "" {
+			var err error
+			pw, err = readPasswordLine("Password de la sala: ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
+				return 1
 			}
-			return chat.RunCreate(*name, *listen, *public, *password)
-		case "relay":
-			return chat.RunCreateUsingRelayWithProtocol(*name, *relay, *password, roomproto.ProtocolRelay)
-		case "guaranteed":
-			return p2pcmd.RunCreateGuaranteed(*name)
-		case "p2p":
-			return p2pcmd.RunCreate(*name, *relay)
-		default:
-			fmt.Fprintf(os.Stderr, "Modo no soportado: %s\n", *mode)
-			return 1
 		}
+		return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
 
 	case "join":
 		fs := flag.NewFlagSet("room join", flag.ContinueOnError)
@@ -206,34 +387,33 @@ func runRoom(args []string) int {
 		mode := fs.String("mode", "auto", "Modo: auto | p2p | direct | relay | guaranteed")
 		relay := fs.String("relay", "", "Multiaddr relay propio (opcional)")
 		direct := fs.Bool("direct", false, "Modo TCP directo")
-		password := fs.String("password", "", "[direct|relay|guaranteed] Password de la sala")
+		password := fs.String("password", "", "Password de la sala")
+		pass := fs.String("pass", "", "Alias de --password")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
 		if *direct {
 			*mode = "direct"
 		}
-
-		if *mode == "auto" {
-			p, _ := roomproto.Unwrap(*code)
-			if p != "" {
-				*mode = p
-			} else {
-				*mode = "p2p"
+		c := strings.TrimSpace(*code)
+		if c == "" {
+			var err error
+			c, err = readLineTrim("Codigo de sala: ")
+			if err != nil || strings.TrimSpace(c) == "" {
+				fmt.Fprintln(os.Stderr, "Error: codigo de sala obligatorio")
+				return 1
 			}
 		}
-
-		switch *mode {
-		case "p2p":
-			return p2pcmd.RunJoin(*name, *code, *relay)
-		case "direct", "relay":
-			return chat.RunJoin(*name, *code, *password)
-		case "guaranteed":
-			return p2pcmd.RunJoinGuaranteed(*name, *code)
-		default:
-			fmt.Fprintf(os.Stderr, "Modo no soportado: %s\n", *mode)
-			return 1
+		pw := mergePass(*password, *pass)
+		if joinNeedsPassword(*mode, c) && pw == "" {
+			var err error
+			pw, err = readPasswordLine("Password de la sala: ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error leyendo password: %v\n", err)
+				return 1
+			}
 		}
+		return execRoomJoin(*name, c, *mode, *relay, *direct, pw)
 
 	case "code":
 		code, err := p2pcmd.LoadLastCode()
@@ -263,29 +443,22 @@ func runRelay(args []string) int {
 		printRelayHelp()
 		return 0
 	}
-
-	switch args[0] {
-	case "serve":
-		fs := flag.NewFlagSet("relay serve", flag.ContinueOnError)
-		fs.SetOutput(os.Stderr)
-		listen := fs.String("listen", "0.0.0.0:10000", "Direccion local del relay host:puerto")
-		public := fs.String("public", "", "Direccion publica del relay host:puerto")
-		if err := fs.Parse(args[1:]); err != nil {
-			return 1
-		}
-		return chat.RunRelayServer(*listen, *public)
-	case "help", "-h", "--help":
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		printRelayHelp()
 		return 0
-	default:
-		fmt.Fprintf(os.Stderr, "Subcomando relay no reconocido: %s\n\n", args[0])
-		printRelayHelp()
+	}
+	serveArgs := args
+	if args[0] == "serve" {
+		serveArgs = args[1:]
+	}
+	fs := flag.NewFlagSet("relay serve", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	listen := fs.String("listen", "0.0.0.0:10000", "Direccion local del relay host:puerto")
+	public := fs.String("public", "", "Direccion publica del relay host:puerto")
+	if err := fs.Parse(serveArgs); err != nil {
 		return 1
 	}
-}
-
-func printMainHelp() {
-	fmt.Printf(mainHelpText, version)
+	return chat.RunRelayServer(*listen, *public)
 }
 
 func printRoomHelp() {

@@ -451,7 +451,7 @@ func (n *Node) RunChat(roomCode string) int {
 		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -475,6 +475,11 @@ func (n *Node) RunChat(roomCode string) int {
 			continue
 		}
 
+		if to, txt, ok := parseAtMentionP2P(line); ok {
+			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
 			switch {
 			case line == "/quit":
@@ -487,7 +492,7 @@ func (n *Node) RunChat(roomCode string) int {
 			case line == "/diag":
 				n.printDiag()
 			case line == "/help":
-				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
 			case strings.HasPrefix(line, "/msg "):
 				to, text, ok := parsePrivate(line)
 				if !ok {
@@ -776,6 +781,24 @@ func (n *Node) allowPeer(name string) bool {
 	}
 	pr.tokens--
 	return true
+}
+
+func parseAtMentionP2P(line string) (to, text string, ok bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "@") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(line[1:])
+	idx := strings.IndexByte(rest, ' ')
+	if idx < 0 {
+		return "", "", false
+	}
+	user := strings.TrimSpace(rest[:idx])
+	msg := strings.TrimSpace(rest[idx+1:])
+	if user == "" || msg == "" {
+		return "", "", false
+	}
+	return user, msg, true
 }
 
 func parsePrivate(line string) (string, string, bool) {
