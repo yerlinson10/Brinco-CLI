@@ -143,7 +143,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		client.name = room.uniqueName(name)
 		room.addClient(client)
 		logx.Info("relay room created", "room", room.id, "user", client.name)
-		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Sala relay creada", Code: room.code, Peers: room.peerNames(), Assigned: client.name, At: time.Now().Unix()})
+		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Sala relay creada", Code: room.code, Peers: room.peerNames(), Assigned: client.name, Host: room.currentHostName(), At: time.Now().Unix()})
 	case msgTypeJoin:
 		room = h.getRoom(first.Room)
 		if room == nil {
@@ -167,7 +167,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		client.name = room.uniqueName(name)
 		room.addClient(client)
 		logx.Info("relay room join", "room", room.id, "user", client.name)
-		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Conectado a la sala relay", Code: room.code, Peers: room.peerNames(), Assigned: client.name, At: time.Now().Unix()})
+		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Conectado a la sala relay", Code: room.code, Peers: room.peerNames(), Assigned: client.name, Host: room.currentHostName(), At: time.Now().Unix()})
 		room.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, client)
 	default:
 		sendDirect(client, wireMessage{Type: msgTypeError, Text: "handshake invalido", At: time.Now().Unix()})
@@ -277,13 +277,14 @@ func (r *relayRoom) addClient(c *serverClient) {
 }
 
 func (r *relayRoom) removeClient(c *serverClient) {
+	var newHost string
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	wasHost := c.isHost
 	delete(r.clients, c)
 	if wasHost {
 		for other := range r.clients {
 			other.isHost = true
+			newHost = other.name
 			select {
 			case other.send <- wireMessage{Type: msgTypeSystem, Text: "Ahora eres host de la sala", At: time.Now().Unix()}:
 			default:
@@ -291,6 +292,21 @@ func (r *relayRoom) removeClient(c *serverClient) {
 			break
 		}
 	}
+	r.mu.Unlock()
+	if newHost != "" {
+		r.broadcast(wireMessage{Type: msgTypeHostUpdate, Host: newHost, At: time.Now().Unix()}, nil)
+	}
+}
+
+func (r *relayRoom) currentHostName() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for c := range r.clients {
+		if c.isHost {
+			return c.name
+		}
+	}
+	return ""
 }
 
 func (r *relayRoom) clientCount() int {
@@ -469,6 +485,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	codeCh := make(chan string, 1)
+	ht := &roomHostTracker{}
 	myNick := strings.TrimSpace(name)
 	if myNick == "" {
 		myNick = "guest"
@@ -504,7 +521,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			if shouldSkipOwnEcho(msg, currentNick) {
 				continue
 			}
-			renderWireMessage(msg, currentNick)
+			renderWireMessage(msg, currentNick, ht)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -515,7 +532,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
-	localLimiter := &inputRateLimiter{tokens: 8, max: 8, refillPerSec: 4, last: time.Now()}
+	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
 	history := make([]string, 0, 50)
 	for {
 		select {
@@ -558,7 +575,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 
 		if isReaction(line) {
 			if !localLimiter.allow() {
-				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				printRateLimitLocal()
 				continue
 			}
 			_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
@@ -567,7 +584,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 
 		if to, txt, ok := parseAtMention(line); ok {
 			if !localLimiter.allow() {
-				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				printRateLimitLocal()
 				continue
 			}
 			_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
@@ -598,7 +615,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			default:
 				if isModerationCommandLine(line) {
 					if !localLimiter.allow() {
-						fmt.Println("Rate limit local: espera un momento para seguir enviando")
+						printRateLimitLocal()
 						continue
 					}
 					_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
@@ -611,7 +628,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 						continue
 					}
 					if !localLimiter.allow() {
-						fmt.Println("Rate limit local: espera un momento para seguir enviando")
+						printRateLimitLocal()
 						continue
 					}
 					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
@@ -621,7 +638,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
 					} else {
 						if !localLimiter.allow() {
-							fmt.Println("Rate limit local: espera un momento para seguir enviando")
+							printRateLimitLocal()
 							continue
 						}
 						_ = writeMessage(conn, msg)
@@ -634,7 +651,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		}
 
 		if !localLimiter.allow() {
-			fmt.Println("Rate limit local: espera un momento para seguir enviando")
+			printRateLimitLocal()
 			continue
 		}
 		at := time.Now().Unix()
@@ -645,6 +662,6 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		nickMu.RLock()
 		currentNick := myNick
 		nickMu.RUnlock()
-		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick)
+		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 	}
 }

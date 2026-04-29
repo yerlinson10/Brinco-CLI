@@ -468,7 +468,7 @@ func (n *Node) RunChat(roomCode string) int {
 	fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
-	localLimiter := &peerRate{tokens: 8, last: time.Now()}
+	localLimiter := &peerRate{tokens: 3, last: time.Now()}
 	history := make([]string, 0, 50)
 	for {
 		select {
@@ -497,7 +497,7 @@ func (n *Node) RunChat(roomCode string) int {
 
 		if isReaction(line) {
 			if !allowLocalP2P(localLimiter) {
-				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				printRateLimitLocalP2P()
 				continue
 			}
 			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
@@ -506,7 +506,7 @@ func (n *Node) RunChat(roomCode string) int {
 
 		if to, txt, ok := parseAtMentionP2P(line); ok {
 			if !allowLocalP2P(localLimiter) {
-				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				printRateLimitLocalP2P()
 				continue
 			}
 			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
@@ -537,7 +537,7 @@ func (n *Node) RunChat(roomCode string) int {
 					continue
 				}
 				if !allowLocalP2P(localLimiter) {
-					fmt.Println("Rate limit local: espera un momento para seguir enviando")
+					printRateLimitLocalP2P()
 					continue
 				}
 				if err := n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}); err != nil {
@@ -545,7 +545,7 @@ func (n *Node) RunChat(roomCode string) int {
 				}
 			case strings.HasPrefix(line, "/send "):
 				if !allowLocalP2P(localLimiter) {
-					fmt.Println("Rate limit local: espera un momento para seguir enviando")
+					printRateLimitLocalP2P()
 					continue
 				}
 				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
@@ -560,7 +560,7 @@ func (n *Node) RunChat(roomCode string) int {
 		}
 
 		if !allowLocalP2P(localLimiter) {
-			fmt.Println("Rate limit local: espera un momento para seguir enviando")
+			printRateLimitLocalP2P()
 			continue
 		}
 		if err := n.publishChatReliable(line); err != nil {
@@ -853,10 +853,12 @@ func (n *Node) allowPeer(name string) bool {
 }
 
 func allowLocalP2P(pr *peerRate) bool {
+	const maxTok = 3.0
+	const refillPerSec = 0.55
 	now := time.Now()
-	pr.tokens += now.Sub(pr.last).Seconds() * 4
-	if pr.tokens > 8 {
-		pr.tokens = 8
+	pr.tokens += now.Sub(pr.last).Seconds() * refillPerSec
+	if pr.tokens > maxTok {
+		pr.tokens = maxTok
 	}
 	pr.last = now
 	if pr.tokens < 1 {
@@ -864,6 +866,15 @@ func allowLocalP2P(pr *peerRate) bool {
 	}
 	pr.tokens--
 	return true
+}
+
+func printRateLimitLocalP2P() {
+	msg := "Rate limit: espera unos segundos antes de seguir enviando."
+	if !supportsColor() {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\x1b[91m%s\x1b[0m\n", msg)
 }
 
 func appendHistory(history []string, line string, max int) []string {
