@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 )
 
@@ -67,6 +68,7 @@ func RunCreate(name, relayAddr string) int {
 
 	fmt.Printf("\nSala creada exitosamente\n")
 	fmt.Printf("Codigo de sala: %s\n", code)
+	clipboard.AnnounceRoomCode(code)
 	fmt.Printf("Peer ID:        %s\n", node.ID())
 	fmt.Println("Comparte el codigo con tus peers")
 	fmt.Println()
@@ -204,6 +206,7 @@ func RunCreateGuaranteed(name string) int {
 
 	fmt.Printf("\nSala creada exitosamente (modo guaranteed)\n")
 	fmt.Printf("Codigo de sala: %s\n", code)
+	clipboard.AnnounceRoomCode(code)
 	fmt.Printf("Peer ID:        %s\n", node.ID())
 	fmt.Println("Comparte el codigo con tus peers")
 	fmt.Println()

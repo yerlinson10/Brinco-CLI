@@ -2,9 +2,9 @@ package p2p
 
 import (
 	"bufio"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -25,9 +25,9 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -87,7 +87,7 @@ type Node struct {
 }
 
 var (
-	nickColorCodesP2P   = []string{
+	nickColorCodesP2P = []string{
 		"38;5;220", "38;5;226", "38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
 		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
 		"38;5;190", "38;5;214", "38;5;208", "38;5;202",
@@ -465,9 +465,11 @@ func (n *Node) RunChat(roomCode string) int {
 		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
+	localLimiter := &peerRate{tokens: 3, last: time.Now()}
+	history := make([]string, 0, 50)
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -483,18 +485,41 @@ func (n *Node) RunChat(roomCode string) int {
 		if line == "" {
 			continue
 		}
+		if line == "!!" {
+			if len(history) == 0 {
+				fmt.Println("Historial vacio")
+				continue
+			}
+			line = history[len(history)-1]
+			fmt.Printf("repite: %s\n", line)
+		}
+		history = appendHistory(history, line, 40)
 
 		if isReaction(line) {
+			if !allowLocalP2P(localLimiter) {
+				printRateLimitLocalP2P()
+				continue
+			}
 			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
-			_ = n.publishMessage(reactionMsg)
-			renderMessage(reactionMsg, n.name)
+			if err := n.publishMessage(reactionMsg); err != nil {
+				fmt.Fprintf(os.Stderr, "Error enviando reaccion: %v\n", err)
+			} else {
+				renderMessage(reactionMsg, n.name)
+			}
 			continue
 		}
 
 		if to, txt, ok := parseAtMentionP2P(line); ok {
+			if !allowLocalP2P(localLimiter) {
+				printRateLimitLocalP2P()
+				continue
+			}
 			pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
-			_ = n.publishMessage(pmMsg)
-			renderMessage(pmMsg, n.name)
+			if err := n.publishMessage(pmMsg); err != nil {
+				fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
+			} else {
+				renderMessage(pmMsg, n.name)
+			}
 			continue
 		}
 
@@ -510,13 +535,19 @@ func (n *Node) RunChat(roomCode string) int {
 			case line == "/diag":
 				n.printDiag()
 			case line == "/help":
-				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 			case line == "/clear":
 				clearConsoleP2P()
+			case line == "/history":
+				printInputHistory(history)
 			case strings.HasPrefix(line, "/msg "):
 				to, text, ok := parsePrivate(line)
 				if !ok {
 					fmt.Println("Uso: /msg <usuario> <texto>")
+					continue
+				}
+				if !allowLocalP2P(localLimiter) {
+					printRateLimitLocalP2P()
 					continue
 				}
 				pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
@@ -526,15 +557,25 @@ func (n *Node) RunChat(roomCode string) int {
 					renderMessage(pmMsg, n.name)
 				}
 			case strings.HasPrefix(line, "/send "):
+				if !allowLocalP2P(localLimiter) {
+					printRateLimitLocalP2P()
+					continue
+				}
 				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando archivo: %v\n", err)
 				}
+			case strings.HasPrefix(line, "/kick ") || strings.HasPrefix(line, "/mute ") || strings.HasPrefix(line, "/unmute ") || strings.HasPrefix(line, "/ban "):
+				fmt.Println("Moderacion host no disponible en modo p2p/guaranteed (sin servidor central).")
 			default:
 				fmt.Println("Comando no reconocido. Usa /help")
 			}
 			continue
 		}
 
+		if !allowLocalP2P(localLimiter) {
+			printRateLimitLocalP2P()
+			continue
+		}
 		if err := n.publishChatReliable(line); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enviando: %v\n", err)
 		}
@@ -822,6 +863,56 @@ func (n *Node) allowPeer(name string) bool {
 	}
 	pr.tokens--
 	return true
+}
+
+func allowLocalP2P(pr *peerRate) bool {
+	const maxTok = 3.0
+	const refillPerSec = 0.55
+	now := time.Now()
+	pr.tokens += now.Sub(pr.last).Seconds() * refillPerSec
+	if pr.tokens > maxTok {
+		pr.tokens = maxTok
+	}
+	pr.last = now
+	if pr.tokens < 1 {
+		return false
+	}
+	pr.tokens--
+	return true
+}
+
+func printRateLimitLocalP2P() {
+	msg := "Rate limit: espera unos segundos antes de seguir enviando."
+	if !supportsColor() {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\x1b[91m%s\x1b[0m\n", msg)
+}
+
+func appendHistory(history []string, line string, max int) []string {
+	if strings.TrimSpace(line) == "" {
+		return history
+	}
+	history = append(history, line)
+	if len(history) > max {
+		history = history[len(history)-max:]
+	}
+	return history
+}
+
+func printInputHistory(history []string) {
+	if len(history) == 0 {
+		fmt.Println("Historial vacio")
+		return
+	}
+	start := 0
+	if len(history) > 20 {
+		start = len(history) - 20
+	}
+	for i := start; i < len(history); i++ {
+		fmt.Printf("%2d) %s\n", i-start+1, history[i])
+	}
 }
 
 func parseAtMentionP2P(line string) (to, text string, ok bool) {

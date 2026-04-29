@@ -17,38 +17,44 @@ import (
 	"sync"
 	"time"
 
+	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 	"brinco-cli/internal/roomproto"
 )
 
 const (
-	msgTypeCreate   = "create"
-	msgTypeJoin     = "join"
-	msgTypeWelcome  = "welcome"
-	msgTypeChat     = "chat"
-	msgTypeSystem   = "system"
-	msgTypeError    = "error"
-	msgTypePeersReq = "peers_req"
-	msgTypePeers    = "peers"
-	msgTypeQuit     = "quit"
-	msgTypePrivate  = "private"
-	msgTypeReaction = "reaction"
-	msgTypeFile     = "file"
-	msgTypeDiagReq  = "diag_req"
-	msgTypeDiag     = "diag"
+	msgTypeCreate     = "create"
+	msgTypeJoin       = "join"
+	msgTypeWelcome    = "welcome"
+	msgTypeChat       = "chat"
+	msgTypeSystem     = "system"
+	msgTypeError      = "error"
+	msgTypePeersReq   = "peers_req"
+	msgTypePeers      = "peers"
+	msgTypeQuit       = "quit"
+	msgTypePrivate    = "private"
+	msgTypeReaction   = "reaction"
+	msgTypeFile       = "file"
+	msgTypeDiagReq    = "diag_req"
+	msgTypeDiag       = "diag"
+	msgTypeModCmd     = "mod_cmd"
+	msgTypeHostUpdate = "host_update"
 
 	roomModeDirect     = "direct"
 	roomModeRelay      = "relay"
 	roomModeGuaranteed = "guaranteed"
 
 	lastRoomCodeFile = "brinco-last-room-code.txt"
+
+	// Dorado reservado al host (no forma parte de la paleta rotativa).
+	hostNickANSI = "38;5;220"
 )
 
 var (
-	nickColorCodes   = []string{
-		"38;5;220", "38;5;226", "38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
+	nickColorCodes = []string{
+		"38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
 		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
-		"38;5;190", "38;5;214", "38;5;208", "38;5;202",
+		"38;5;190", "38;5;226", "38;5;214", "38;5;208", "38;5;202",
 		"38;5;196", "38;5;197", "38;5;198", "38;5;199", "38;5;200", "38;5;201",
 		"38;5;129", "38;5;135", "38;5;141", "38;5;147", "38;5;153", "38;5;159",
 		"38;5;123", "38;5;87", "38;5;81", "38;5;75", "38;5;69", "38;5;63",
@@ -82,7 +88,33 @@ type wireMessage struct {
 	NATEst      string   `json:"natEst,omitempty"`
 	// Assigned es el nombre final en sala (tras uniqueName); solo en welcome.
 	Assigned string `json:"assigned,omitempty"`
-	At       int64  `json:"at"`
+	// Host es el nick del moderador de sala (mismo valor para todos los clientes).
+	Host string `json:"host,omitempty"`
+	At   int64  `json:"at"`
+}
+
+// roomHostTracker guarda el nick del host anunciado por el servidor (welcome / host_update).
+type roomHostTracker struct {
+	mu   sync.Mutex
+	name string
+}
+
+func (t *roomHostTracker) set(s string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.name = strings.TrimSpace(s)
+	t.mu.Unlock()
+}
+
+func (t *roomHostTracker) get() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.name
 }
 
 type serverClient struct {
@@ -91,6 +123,14 @@ type serverClient struct {
 	send   chan wireMessage
 	last   time.Time
 	tokens float64
+	isHost bool
+}
+
+type inputRateLimiter struct {
+	tokens       float64
+	max          float64
+	refillPerSec float64
+	last         time.Time
 }
 
 type roomServer struct {
@@ -102,6 +142,8 @@ type roomServer struct {
 
 	mu      sync.Mutex
 	clients map[*serverClient]struct{}
+	muted   map[string]bool
+	banned  map[string]bool
 }
 
 func RunCreate(name, listenAddr, publicAddr, password string) int {
@@ -142,6 +184,7 @@ func RunCreate(name, listenAddr, publicAddr, password string) int {
 
 	fmt.Println("Sala creada")
 	fmt.Printf("Codigo de sala: %s\n", code)
+	clipboard.AnnounceRoomCode(code)
 	fmt.Println("Comparte este codigo con tus peers")
 	logx.Info("chat sala creada", "mode", roomModeDirect, "room", roomID)
 
@@ -311,6 +354,8 @@ func startServer(listenAddr, roomID, password, code string) (*roomServer, error)
 		code:         code,
 		ln:           ln,
 		clients:      make(map[*serverClient]struct{}),
+		muted:        make(map[string]bool),
+		banned:       make(map[string]bool),
 	}
 	go s.acceptLoop()
 	return s, nil
@@ -383,6 +428,12 @@ func (s *roomServer) handleConn(conn net.Conn) {
 	if name == "" {
 		name = "anon"
 	}
+	if s.isBannedName(name) {
+		sendDirect(client, wireMessage{Type: msgTypeError, Text: "estas baneado de esta sala", At: time.Now().Unix()})
+		close(client.send)
+		<-writerDone
+		return
+	}
 	client.name = s.uniqueName(name)
 	s.addClient(client)
 
@@ -392,6 +443,7 @@ func (s *roomServer) handleConn(conn net.Conn) {
 		Code:     s.code,
 		Peers:    s.peerNames(),
 		Assigned: client.name,
+		Host:     s.currentHostName(),
 		At:       time.Now().Unix(),
 	})
 	s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, nil)
@@ -417,6 +469,12 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 	if !c.allowMessage() {
 		sendDirect(c, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()})
 		return
+	}
+	if msg.Type != msgTypePeersReq && msg.Type != msgTypeDiagReq && msg.Type != msgTypeQuit && msg.Type != msgTypeModCmd {
+		if s.isMuted(c.name) {
+			sendDirect(c, wireMessage{Type: msgTypeError, Text: "estas silenciado por el host", At: time.Now().Unix()})
+			return
+		}
 	}
 	switch msg.Type {
 	case msgTypeChat:
@@ -445,18 +503,22 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 		s.broadcast(wireMessage{Type: msgTypeFile, From: c.name, FileName: msg.FileName, FilePayload: msg.FilePayload, At: time.Now().Unix()}, nil)
 	case msgTypeQuit:
 		return
+	case msgTypeModCmd:
+		s.handleModerationCommand(c, msg.Text)
 	}
 }
 
 func (c *serverClient) allowMessage() bool {
+	const maxTok = 5.0
+	const refillPerSec = 2.0
 	now := time.Now()
 	if c.last.IsZero() {
 		c.last = now
-		c.tokens = 12
+		c.tokens = maxTok
 	}
-	c.tokens += now.Sub(c.last).Seconds() * 6
-	if c.tokens > 12 {
-		c.tokens = 12
+	c.tokens += now.Sub(c.last).Seconds() * refillPerSec
+	if c.tokens > maxTok {
+		c.tokens = maxTok
 	}
 	c.last = now
 	if c.tokens < 1 {
@@ -469,13 +531,32 @@ func (c *serverClient) allowMessage() bool {
 func (s *roomServer) addClient(c *serverClient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.clients) == 0 {
+		c.isHost = true
+	}
 	s.clients[c] = struct{}{}
 }
 
 func (s *roomServer) removeClient(c *serverClient) {
+	var newHost string
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	wasHost := c.isHost
 	delete(s.clients, c)
+	if wasHost {
+		for other := range s.clients {
+			other.isHost = true
+			newHost = other.name
+			select {
+			case other.send <- wireMessage{Type: msgTypeSystem, Text: "Ahora eres host de la sala", At: time.Now().Unix()}:
+			default:
+			}
+			break
+		}
+	}
+	s.mu.Unlock()
+	if newHost != "" {
+		s.broadcast(wireMessage{Type: msgTypeHostUpdate, Host: newHost, At: time.Now().Unix()}, nil)
+	}
 }
 
 func (s *roomServer) broadcast(msg wireMessage, except *serverClient) {
@@ -520,6 +601,105 @@ func (s *roomServer) sendPrivate(from *serverClient, toName, text string) {
 		default:
 		}
 	}
+}
+
+func (s *roomServer) isMuted(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.muted[normalizeNickKey(name)]
+}
+
+func (s *roomServer) isBannedName(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.banned[normalizeNickKey(name)]
+}
+
+func (s *roomServer) findClientByName(name string) *serverClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := strings.TrimSpace(name)
+	for c := range s.clients {
+		if c.name == target {
+			return c
+		}
+	}
+	return nil
+}
+
+func (s *roomServer) handleModerationCommand(sender *serverClient, line string) {
+	if !sender.isHost {
+		sendDirect(sender, wireMessage{Type: msgTypeError, Text: "solo el host puede moderar", At: time.Now().Unix()})
+		return
+	}
+	cmd, user, ok := parseModerationCommand(line)
+	if !ok {
+		sendDirect(sender, wireMessage{Type: msgTypeError, Text: "uso: /kick|/mute|/unmute|/ban <usuario>", At: time.Now().Unix()})
+		return
+	}
+	target := s.findClientByName(user)
+	switch cmd {
+	case "/mute":
+		s.mu.Lock()
+		s.muted[normalizeNickKey(user)] = true
+		s.mu.Unlock()
+		if target != nil {
+			sendDirect(target, wireMessage{Type: msgTypeSystem, Text: "Has sido silenciado por el host", At: time.Now().Unix()})
+		}
+		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s fue silenciado por el host", user), At: time.Now().Unix()}, nil)
+	case "/unmute":
+		s.mu.Lock()
+		delete(s.muted, normalizeNickKey(user))
+		s.mu.Unlock()
+		if target != nil {
+			sendDirect(target, wireMessage{Type: msgTypeSystem, Text: "Ya no estas silenciado", At: time.Now().Unix()})
+		}
+		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s ya puede escribir", user), At: time.Now().Unix()}, nil)
+	case "/kick":
+		if target == nil {
+			sendDirect(sender, wireMessage{Type: msgTypeError, Text: "usuario no encontrado", At: time.Now().Unix()})
+			return
+		}
+		sendDirect(target, wireMessage{Type: msgTypeError, Text: "expulsado por el host", At: time.Now().Unix()})
+		_ = target.conn.Close()
+	case "/ban":
+		s.mu.Lock()
+		s.banned[normalizeNickKey(user)] = true
+		delete(s.muted, normalizeNickKey(user))
+		s.mu.Unlock()
+		if target != nil {
+			sendDirect(target, wireMessage{Type: msgTypeError, Text: "baneado por el host", At: time.Now().Unix()})
+			_ = target.conn.Close()
+		}
+		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s fue baneado por el host", user), At: time.Now().Unix()}, nil)
+	}
+}
+
+func parseModerationCommand(line string) (cmd, user string, ok bool) {
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	c := strings.ToLower(parts[0])
+	if c != "/kick" && c != "/mute" && c != "/unmute" && c != "/ban" {
+		return "", "", false
+	}
+	return c, strings.TrimSpace(parts[1]), true
+}
+
+func normalizeNickKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func (s *roomServer) currentHostName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for c := range s.clients {
+		if c.isHost {
+			return c.name
+		}
+	}
+	return ""
 }
 
 func (s *roomServer) peerNames() []string {
@@ -569,6 +749,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
+	ht := &roomHostTracker{}
 	myNick := strings.TrimSpace(name)
 	if myNick == "" {
 		myNick = "guest"
@@ -595,7 +776,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			if shouldSkipOwnEcho(msg, currentNick) {
 				continue
 			}
-			renderWireMessage(msg, currentNick)
+			renderWireMessage(msg, currentNick, ht)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -603,9 +784,11 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
+	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
+	history := make([]string, 0, 50)
 	for {
 		select {
 		case <-done:
@@ -627,13 +810,30 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 		if line == "" {
 			continue
 		}
+		if line == "!!" {
+			if len(history) == 0 {
+				fmt.Println("Historial vacio")
+				continue
+			}
+			line = history[len(history)-1]
+			fmt.Printf("repite: %s\n", line)
+		}
+		history = appendHistory(history, line, 40)
 
 		if isReaction(line) {
+			if !localLimiter.allow() {
+				printRateLimitLocal()
+				continue
+			}
 			_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
 			continue
 		}
 
 		if to, txt, ok := parseAtMention(line); ok {
+			if !localLimiter.allow() {
+				printRateLimitLocal()
+				continue
+			}
 			_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
 			continue
 		}
@@ -654,14 +854,28 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u t | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u t | /send archivo /quit /help")
 			case "/clear":
 				clearConsole()
+			case "/history":
+				printInputHistory(history)
 			default:
+				if isModerationCommandLine(line) {
+					if !localLimiter.allow() {
+						printRateLimitLocal()
+						continue
+					}
+					_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
+					continue
+				}
 				if strings.HasPrefix(line, "/msg ") {
 					to, text, ok := parsePrivateCommand(line)
 					if !ok {
 						fmt.Println("Uso: /msg <usuario> <texto>")
+						continue
+					}
+					if !localLimiter.allow() {
+						printRateLimitLocal()
 						continue
 					}
 					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
@@ -670,6 +884,10 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
 					} else {
+						if !localLimiter.allow() {
+							printRateLimitLocal()
+							continue
+						}
 						_ = writeMessage(conn, msg)
 					}
 				} else {
@@ -679,6 +897,10 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			continue
 		}
 
+		if !localLimiter.allow() {
+			printRateLimitLocal()
+			continue
+		}
 		at := time.Now().Unix()
 		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: at}); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enviando mensaje: %v\n", err)
@@ -687,7 +909,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 		nickMu.RLock()
 		currentNick := myNick
 		nickMu.RUnlock()
-		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick)
+		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 	}
 }
 
@@ -765,10 +987,26 @@ func runWithReconnect(runOnce func() int) int {
 	return 1
 }
 
-func renderWireMessage(msg wireMessage, myNick string) {
+func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
+	if ht != nil && msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Host) != "" {
+		ht.set(msg.Host)
+	}
+	if msg.Type == msgTypeHostUpdate && strings.TrimSpace(msg.Host) != "" {
+		if ht != nil {
+			ht.set(msg.Host)
+		}
+		t := time.Unix(msg.At, 0).Format("15:04:05")
+		fmt.Printf("[%s] %s\n", t, colorizeSystem("Nuevo host de la sala: "+strings.TrimSpace(msg.Host)))
+		return
+	}
+
 	t := time.Unix(msg.At, 0).Format("15:04:05")
-	fromLabel := displayNick(msg.From, myNick)
-	toLabel := displayNick(msg.To, myNick)
+	hostVal := ""
+	if ht != nil {
+		hostVal = ht.get()
+	}
+	fromLabel := displayNick(msg.From, myNick, hostVal)
+	toLabel := displayNick(msg.To, myNick, hostVal)
 	switch msg.Type {
 	case msgTypeWelcome:
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
@@ -808,16 +1046,39 @@ func renderWireMessage(msg wireMessage, myNick string) {
 	}
 }
 
-func displayNick(nick, myNick string) string {
+func displayNick(nick, myNick, roomHost string) string {
 	n := strings.TrimSpace(nick)
 	if n == "" {
 		return colorizeName(nick)
 	}
-	label := colorizeName(n)
 	if n == strings.TrimSpace(myNick) {
-		return label + " (tu)"
+		return colorizeName(n) + " (tu)"
 	}
-	return label
+	if rh := strings.TrimSpace(roomHost); rh != "" && strings.EqualFold(n, rh) {
+		return colorizeFixed(n, hostNickANSI)
+	}
+	return colorizeName(n)
+}
+
+func nickBaseForPalette(displayed string) string {
+	s := strings.TrimSpace(displayed)
+	ls := strings.ToLower(s)
+	suf := " (tu)"
+	if strings.HasSuffix(ls, suf) {
+		return strings.TrimSpace(s[:len(s)-len(suf)])
+	}
+	return s
+}
+
+func nickColorKey(name string) string {
+	return strings.ToLower(nickBaseForPalette(name))
+}
+
+func colorizeFixed(name, code string) string {
+	if !supportsColor() {
+		return name
+	}
+	return "\x1b[" + code + "m" + name + "\x1b[0m"
 }
 
 func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
@@ -836,6 +1097,62 @@ func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
 
 func clearConsole() {
 	fmt.Print("\033[2J\033[H")
+}
+
+func printRateLimitLocal() {
+	msg := "Rate limit: espera unos segundos antes de seguir enviando."
+	if !supportsColor() {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\x1b[91m%s\x1b[0m\n", msg)
+}
+
+func (l *inputRateLimiter) allow() bool {
+	now := time.Now()
+	if l.last.IsZero() {
+		l.last = now
+	}
+	l.tokens += now.Sub(l.last).Seconds() * l.refillPerSec
+	if l.tokens > l.max {
+		l.tokens = l.max
+	}
+	l.last = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
+}
+
+func appendHistory(history []string, line string, max int) []string {
+	if strings.TrimSpace(line) == "" {
+		return history
+	}
+	history = append(history, line)
+	if len(history) > max {
+		history = history[len(history)-max:]
+	}
+	return history
+}
+
+func printInputHistory(history []string) {
+	if len(history) == 0 {
+		fmt.Println("Historial vacio")
+		return
+	}
+	start := 0
+	if len(history) > 20 {
+		start = len(history) - 20
+	}
+	for i := start; i < len(history); i++ {
+		fmt.Printf("%2d) %s\n", i-start+1, history[i])
+	}
+}
+
+func isModerationCommandLine(line string) bool {
+	cmd, _, ok := parseModerationCommand(line)
+	return ok && cmd != ""
 }
 
 func parseAtMention(line string) (to, text string, ok bool) {
@@ -941,7 +1258,7 @@ func colorizeName(name string) string {
 	if !supportsColor() {
 		return name
 	}
-	key := strings.ToLower(strings.TrimSpace(name))
+	key := nickColorKey(name)
 	if key == "" {
 		return name
 	}
