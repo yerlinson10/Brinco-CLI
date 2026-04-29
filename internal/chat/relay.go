@@ -145,7 +145,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		client.name = room.uniqueName(name)
 		room.addClient(client)
 		logx.Info("relay room created", "room", room.id, "user", client.name)
-		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Sala relay creada", Code: room.code, Peers: room.peerNames(), At: time.Now().Unix()})
+		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Sala relay creada", Code: room.code, Peers: room.peerNames(), Assigned: client.name, At: time.Now().Unix()})
 	case msgTypeJoin:
 		room = h.getRoom(first.Room)
 		if room == nil {
@@ -163,7 +163,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 		client.name = room.uniqueName(name)
 		room.addClient(client)
 		logx.Info("relay room join", "room", room.id, "user", client.name)
-		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Conectado a la sala relay", Code: room.code, Peers: room.peerNames(), At: time.Now().Unix()})
+		sendDirect(client, wireMessage{Type: msgTypeWelcome, Text: "Conectado a la sala relay", Code: room.code, Peers: room.peerNames(), Assigned: client.name, At: time.Now().Unix()})
 		room.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, client)
 	default:
 		sendDirect(client, wireMessage{Type: msgTypeError, Text: "handshake invalido", At: time.Now().Unix()})
@@ -186,6 +186,20 @@ func (h *relayHub) handleConn(conn net.Conn) {
 			room.broadcast(wireMessage{Type: msgTypeChat, From: client.name, Text: text, At: time.Now().Unix()}, nil)
 		case msgTypePeersReq:
 			sendDirect(client, wireMessage{Type: msgTypePeers, Peers: room.peerNames(), At: time.Now().Unix()})
+		case msgTypeDiagReq:
+			sendDirect(client, wireMessage{Type: msgTypeDiag, State: "connected", RTTMs: 0, RelayUsed: true, NATEst: "desconocido", At: time.Now().Unix()})
+		case msgTypePrivate:
+			if strings.TrimSpace(msg.To) != "" && strings.TrimSpace(msg.Text) != "" {
+				room.sendPrivate(client, msg.To, msg.Text)
+			}
+		case msgTypeReaction:
+			if isReaction(msg.Text) {
+				room.broadcast(wireMessage{Type: msgTypeReaction, From: client.name, Text: msg.Text, At: time.Now().Unix()}, nil)
+			}
+		case msgTypeFile:
+			if strings.TrimSpace(msg.FileName) != "" && len(msg.FilePayload) <= 2_200_000 {
+				room.broadcast(wireMessage{Type: msgTypeFile, From: client.name, FileName: msg.FileName, FilePayload: msg.FilePayload, At: time.Now().Unix()}, nil)
+			}
 		case msgTypeQuit:
 			goto cleanup
 		}
@@ -301,6 +315,36 @@ func (r *relayRoom) broadcast(msg wireMessage, except *serverClient) {
 	}
 }
 
+func (r *relayRoom) sendPrivate(from *serverClient, toName, text string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var to *serverClient
+	for c := range r.clients {
+		if c.name == strings.TrimSpace(toName) {
+			to = c
+			break
+		}
+	}
+	if to == nil {
+		select {
+		case from.send <- wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}:
+		default:
+		}
+		return
+	}
+	msg := wireMessage{Type: msgTypePrivate, From: from.name, To: to.name, Text: text, At: time.Now().Unix()}
+	select {
+	case from.send <- msg:
+	default:
+	}
+	if to != from {
+		select {
+		case to.send <- msg:
+		default:
+		}
+	}
+}
+
 func runRelayClient(relayAddr, roomID, name, password, roomCode string, create bool, codeProtocol string) int {
 	conn, err := net.Dial("tcp", relayAddr)
 	if err != nil {
@@ -329,10 +373,14 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		var myNick string
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
 				continue
+			}
+			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
+				myNick = strings.TrimSpace(msg.Assigned)
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Code) != "" {
 				if create && strings.TrimSpace(codeProtocol) != "" {
@@ -343,7 +391,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				default:
 				}
 			}
-			renderMessage(msg)
+			renderWireMessage(msg, myNick)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -351,7 +399,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -368,6 +416,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			select {
 			case err := <-errCh:
 				fmt.Fprintf(os.Stderr, "Conexion cerrada: %v\n", err)
+				return 2
 			default:
 			}
 			return 0
@@ -383,6 +432,11 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			continue
 		}
 
+		if isReaction(line) {
+			_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
 			switch line {
 			case "/quit":
@@ -390,6 +444,8 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				return 0
 			case "/peers":
 				_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
+			case "/diag":
+				_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
 			case "/code":
 				if strings.TrimSpace(roomCode) != "" {
 					fmt.Printf("Codigo de sala: %s\n", roomCode)
@@ -397,9 +453,25 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
 			default:
-				fmt.Println("Comando no reconocido. Usa /help")
+				if strings.HasPrefix(line, "/msg ") {
+					to, text, ok := parsePrivateCommand(line)
+					if !ok {
+						fmt.Println("Uso: /msg <usuario> <texto>")
+						continue
+					}
+					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
+				} else if strings.HasPrefix(line, "/send ") {
+					msg, err := buildFileMessage(strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
+					} else {
+						_ = writeMessage(conn, msg)
+					}
+				} else {
+					fmt.Println("Comando no reconocido. Usa /help")
+				}
 			}
 			continue
 		}

@@ -32,6 +32,11 @@ const (
 	msgTypePeersReq = "peers_req"
 	msgTypePeers    = "peers"
 	msgTypeQuit     = "quit"
+	msgTypePrivate  = "private"
+	msgTypeReaction = "reaction"
+	msgTypeFile     = "file"
+	msgTypeDiagReq  = "diag_req"
+	msgTypeDiag     = "diag"
 
 	roomModeDirect     = "direct"
 	roomModeRelay      = "relay"
@@ -51,16 +56,27 @@ type wireMessage struct {
 	Type  string   `json:"type"`
 	Room  string   `json:"room,omitempty"`
 	From  string   `json:"from,omitempty"`
+	To    string   `json:"to,omitempty"`
 	Text  string   `json:"text,omitempty"`
 	Peers []string `json:"peers,omitempty"`
 	Code  string   `json:"code,omitempty"`
-	At    int64    `json:"at"`
+	FileName    string `json:"fileName,omitempty"`
+	FilePayload string `json:"filePayload,omitempty"`
+	State       string `json:"state,omitempty"`
+	RTTMs       int64  `json:"rttMs,omitempty"`
+	RelayUsed   bool   `json:"relayUsed,omitempty"`
+	NATEst      string `json:"natEst,omitempty"`
+	// Assigned es el nombre final en sala (tras uniqueName); solo en welcome.
+	Assigned string `json:"assigned,omitempty"`
+	At       int64  `json:"at"`
 }
 
 type serverClient struct {
 	name string
 	conn net.Conn
 	send chan wireMessage
+	last   time.Time
+	tokens float64
 }
 
 type roomServer struct {
@@ -155,9 +171,13 @@ func RunJoin(name, code, password string) int {
 
 	fmt.Printf("Conectando a %s...\n", addr)
 	if mode == roomModeRelay || mode == roomModeGuaranteed {
-		return runRelayClient(addr, roomID, name, password, code, false, mode)
+		return runWithReconnect(func() int {
+			return runRelayClient(addr, roomID, name, password, code, false, mode)
+		})
 	}
-	return runClient(addr, roomID, name, password, code)
+	return runWithReconnect(func() int {
+		return runClient(addr, roomID, name, password, code)
+	})
 }
 
 func BuildRoomCode(addr, room string) (string, error) {
@@ -365,6 +385,7 @@ func (s *roomServer) handleConn(conn net.Conn) {
 		Text:  "Conectado a la sala",
 		Code:  s.code,
 		Peers: s.peerNames(),
+		Assigned: client.name,
 		At:    time.Now().Unix(),
 	})
 	s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, nil)
@@ -387,6 +408,10 @@ func (s *roomServer) handleConn(conn net.Conn) {
 }
 
 func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
+	if !c.allowMessage() {
+		sendDirect(c, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()})
+		return
+	}
 	switch msg.Type {
 	case msgTypeChat:
 		text := strings.TrimSpace(msg.Text)
@@ -396,9 +421,43 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 		s.broadcast(wireMessage{Type: msgTypeChat, From: c.name, Text: text, At: time.Now().Unix()}, nil)
 	case msgTypePeersReq:
 		sendDirect(c, wireMessage{Type: msgTypePeers, Peers: s.peerNames(), At: time.Now().Unix()})
+	case msgTypeDiagReq:
+		sendDirect(c, wireMessage{Type: msgTypeDiag, State: "connected", RTTMs: 0, RelayUsed: false, NATEst: "desconocido", At: time.Now().Unix()})
+	case msgTypePrivate:
+		if strings.TrimSpace(msg.To) == "" || strings.TrimSpace(msg.Text) == "" {
+			return
+		}
+		s.sendPrivate(c, msg.To, msg.Text)
+	case msgTypeReaction:
+		if isReaction(msg.Text) {
+			s.broadcast(wireMessage{Type: msgTypeReaction, From: c.name, Text: msg.Text, At: time.Now().Unix()}, nil)
+		}
+	case msgTypeFile:
+		if strings.TrimSpace(msg.FileName) == "" || len(msg.FilePayload) > 2_200_000 {
+			return
+		}
+		s.broadcast(wireMessage{Type: msgTypeFile, From: c.name, FileName: msg.FileName, FilePayload: msg.FilePayload, At: time.Now().Unix()}, nil)
 	case msgTypeQuit:
 		return
 	}
+}
+
+func (c *serverClient) allowMessage() bool {
+	now := time.Now()
+	if c.last.IsZero() {
+		c.last = now
+		c.tokens = 12
+	}
+	c.tokens += now.Sub(c.last).Seconds() * 6
+	if c.tokens > 12 {
+		c.tokens = 12
+	}
+	c.last = now
+	if c.tokens < 1 {
+		return false
+	}
+	c.tokens--
+	return true
 }
 
 func (s *roomServer) addClient(c *serverClient) {
@@ -422,6 +481,36 @@ func (s *roomServer) broadcast(msg wireMessage, except *serverClient) {
 		}
 		select {
 		case c.send <- msg:
+		default:
+		}
+	}
+}
+
+func (s *roomServer) sendPrivate(from *serverClient, toName, text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var to *serverClient
+	for c := range s.clients {
+		if c.name == strings.TrimSpace(toName) {
+			to = c
+			break
+		}
+	}
+	if to == nil {
+		select {
+		case from.send <- wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}:
+		default:
+		}
+		return
+	}
+	msg := wireMessage{Type: msgTypePrivate, From: from.name, To: to.name, Text: text, At: time.Now().Unix()}
+	select {
+	case from.send <- msg:
+	default:
+	}
+	if to != from {
+		select {
+		case to.send <- msg:
 		default:
 		}
 	}
@@ -479,12 +568,16 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		var myNick string
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
 				continue
 			}
-			renderMessage(msg)
+			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
+				myNick = strings.TrimSpace(msg.Assigned)
+			}
+			renderWireMessage(msg, myNick)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -492,7 +585,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -501,6 +594,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			select {
 			case err := <-errCh:
 				fmt.Fprintf(os.Stderr, "Conexion cerrada: %v\n", err)
+				return 2
 			default:
 			}
 			return 0
@@ -516,6 +610,11 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			continue
 		}
 
+		if isReaction(line) {
+			_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
 			switch line {
 			case "/quit":
@@ -523,6 +622,8 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 				return 0
 			case "/peers":
 				_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
+			case "/diag":
+				_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
 			case "/code":
 				if strings.TrimSpace(roomCode) != "" {
 					fmt.Printf("Codigo de sala: %s\n", roomCode)
@@ -530,9 +631,25 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
 			default:
-				fmt.Println("Comando no reconocido. Usa /help")
+				if strings.HasPrefix(line, "/msg ") {
+					to, text, ok := parsePrivateCommand(line)
+					if !ok {
+						fmt.Println("Uso: /msg <usuario> <texto>")
+						continue
+					}
+					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
+				} else if strings.HasPrefix(line, "/send ") {
+					msg, err := buildFileMessage(strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
+					} else {
+						_ = writeMessage(conn, msg)
+					}
+				} else {
+					fmt.Println("Comando no reconocido. Usa /help")
+				}
 			}
 			continue
 		}
@@ -600,11 +717,32 @@ func randomID(nBytes int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func renderMessage(msg wireMessage) {
+func runWithReconnect(runOnce func() int) int {
+	backoff := 500 * time.Millisecond
+	for attempts := 0; attempts < 7; attempts++ {
+		code := runOnce()
+		if code != 2 {
+			return code
+		}
+		fmt.Printf("Estado: reconectando (intento %d)\n", attempts+1)
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > 6*time.Second {
+			backoff = 6 * time.Second
+		}
+	}
+	fmt.Println("Estado: degradado (sin reconexion)")
+	return 1
+}
+
+func renderWireMessage(msg wireMessage, myNick string) {
 	t := time.Unix(msg.At, 0).Format("15:04:05")
 	switch msg.Type {
 	case msgTypeWelcome:
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
+		if strings.TrimSpace(msg.Assigned) != "" {
+			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Tu nombre:"), msg.Assigned)
+		}
 		if msg.Code != "" {
 			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Codigo:"), msg.Code)
 		}
@@ -617,9 +755,106 @@ func renderMessage(msg wireMessage) {
 		fmt.Printf("[%s] %s\n", t, colorizeError(msg.Text))
 	case msgTypePeers:
 		fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
+	case msgTypeDiag:
+		fmt.Printf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s\n", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)
 	case msgTypeChat:
 		fmt.Printf("[%s] %s: %s\n", t, colorizeName(msg.From), msg.Text)
+	case msgTypePrivate:
+		if myNick != "" && msg.To != myNick && msg.From != myNick {
+			return
+		}
+		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, colorizeName(msg.From), colorizeName(msg.To), msg.Text)
+	case msgTypeReaction:
+		fmt.Printf("[%s] %s reacciono %s\n", t, colorizeName(msg.From), msg.Text)
+	case msgTypeFile:
+		path, size, err := saveIncomingFile(msg)
+		if err != nil {
+			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, colorizeName(msg.From), msg.FileName, err)
+		} else {
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, colorizeName(msg.From), msg.FileName, size, path)
+		}
 	}
+}
+
+func parsePrivateCommand(line string) (string, string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(line, "/msg ")), " ", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
+}
+
+func isReaction(v string) bool {
+	s := strings.TrimSpace(v)
+	if s == "+1" || s == "-1" || s == "ok" {
+		return true
+	}
+	return strings.HasPrefix(s, ":") && strings.HasSuffix(s, ":") && len(s) > 2
+}
+
+func buildFileMessage(path string) (wireMessage, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return wireMessage{}, err
+	}
+	if len(raw) > 1_500_000 {
+		return wireMessage{}, fmt.Errorf("archivo excede 1.5MB")
+	}
+	name := path
+	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
+		name = path[idx+1:]
+	}
+	return wireMessage{
+		Type:        msgTypeFile,
+		FileName:    name,
+		FilePayload: base64.StdEncoding.EncodeToString(raw),
+		At:          time.Now().Unix(),
+	}, nil
+}
+
+func saveIncomingFile(msg wireMessage) (string, int, error) {
+	raw, err := base64.StdEncoding.DecodeString(msg.FilePayload)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(raw) > 1_500_000 {
+		return "", 0, fmt.Errorf("archivo recibido excede limite")
+	}
+	name := sanitizeFileName(msg.FileName)
+	if name == "" {
+		name = "archivo.bin"
+	}
+	dir, err := downloadDir()
+	if err != nil {
+		return "", 0, err
+	}
+	filePath := filepath.Join(dir, fmt.Sprintf("brinco-%d-%s", time.Now().Unix(), name))
+	if err := os.WriteFile(filePath, raw, 0o600); err != nil {
+		return "", 0, err
+	}
+	return filePath, len(raw), nil
+}
+
+func downloadDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		downloads := filepath.Join(home, "Downloads")
+		if st, serr := os.Stat(downloads); serr == nil && st.IsDir() {
+			return downloads, nil
+		}
+	}
+	return os.Getwd()
+}
+
+func sanitizeFileName(name string) string {
+	n := filepath.Base(strings.TrimSpace(name))
+	n = strings.ReplaceAll(n, ":", "_")
+	n = strings.ReplaceAll(n, "\\", "_")
+	n = strings.ReplaceAll(n, "/", "_")
+	if n == "." || n == "" {
+		return ""
+	}
+	return n
 }
 
 func colorizeName(name string) string {

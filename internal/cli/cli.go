@@ -9,31 +9,150 @@ import (
 	"brinco-cli/internal/logx"
 	p2pcmd "brinco-cli/internal/p2p"
 	"brinco-cli/internal/roomproto"
+	"brinco-cli/internal/updater"
 )
 
 const version = "0.2.0"
 
+const mainHelpText = `brinco-cli v%s - Chat P2P / relay / TCP desde consola
+
+USO GENERAL
+  brinco <comando> [argumentos]
+  brinco help              Esta ayuda
+  brinco version           Version del binario
+
+COMANDOS PRINCIPALES
+  room create|join|code    Salas de chat (ver: brinco room help)
+  relay serve              Relay TCP propio para modo relay (ver: brinco relay help)
+  update check|apply       Actualizacion desde GitHub Releases (ver: brinco update help)
+
+CODIGOS DE SALA (prefijo = protocolo)
+  p2p-...         libp2p + GossipSub (relay libp2p opcional con --relay)
+  guaranteed-...  libp2p con relay automatico via red IPFS
+  relay-...       Cliente TCP hacia tu relay (brinco relay serve)
+  direct-...      TCP directo entre host y clientes
+
+LOGS
+  Archivo bajo el directorio de cache del usuario, p. ej. Windows:
+  %%LOCALAPPDATA%%\brinco-cli\logs\brinco.log
+  Nivel: variable de entorno BRINCO_LOG_LEVEL (debug|info|warn|error)
+
+Mas detalle: brinco room help | brinco relay help | brinco update help
+`
+
+const roomHelpText = `brinco room — Salas de chat
+
+USO
+  brinco room create [flags]
+  brinco room join   [flags]
+  brinco room code
+
+SUBCOMANDOS
+  create   Crea sala y entra al chat interactivo
+  join     Entra con --code <codigo>
+  code     Imprime el ultimo codigo guardado en disco (p2p o chat TCP)
+
+--- room create ---
+
+FLAGS
+  --name string       Nombre visible inicial (default: host). El servidor puede asignar
+                      un sufijo (#2) si el nombre ya existe (modo relay/direct).
+  --mode string       p2p | direct | relay | guaranteed (default: p2p)
+  --relay string      p2p: multiaddr relay libp2p opcional, ej. /ip4/HOST/tcp/PORT/p2p/PEERID
+                      relay: host:puerto del relay TCP (obligatorio en --mode relay)
+  --password string   Obligatorio en direct y relay. No se usa en create p2p/guaranteed.
+  --direct            Atajo: equivale a --mode direct
+  --listen string     Solo direct: escucha local (default: 0.0.0.0:9090)
+  --public string     Solo direct: host:puerto que veran los demas (obligatorio si listen es 0.0.0.0)
+
+NOTAS
+  Modo direct con --relay: crea sala usando relay TCP (caso avanzado).
+  Modo guaranteed: sin relay manual; espera direccion relay en la red IPFS.
+
+--- room join ---
+
+FLAGS
+  --name string       Nombre visible (default: guest)
+  --code string       Codigo de sala (obligatorio)
+  --mode string       auto | p2p | direct | relay | guaranteed (default: auto)
+                      auto: el prefijo del codigo fija el modo (p2p-, relay-, etc.)
+  --relay string      Solo p2p: relay libp2p extra opcional
+  --password string   Obligatorio en direct y relay (misma clave que el host)
+  --direct            Atajo: --mode direct
+
+--- Dentro del chat (todos los modos salvo detalles solo p2p) ---
+
+  /code              Muestra el codigo de la sala
+  /peers             Lista peers (TCP) o cuenta en topic (p2p)
+  /diag              Diagnostico: estado, relay, NAT estimado; en p2p incluye RTT por peer
+  /msg USER TEXTO    Mensaje privado solo para USER (nombre exacto en sala, ver "Tu nombre:")
+  /send RUTA         Archivo pequeno (limite ~1.5 MB). El receptor lo guarda en Descargas
+  /quit              Salir
+  /help              Esta lista
+
+  Reacciones (linea sola, sin /): +1  -1  ok  :emoji:
+  Cualquier otra linea se envia como mensaje de chat.
+
+SEGURIDAD / RED (resumen)
+  relay/direct: anti-flood por conexion en el servidor; privados solo remitente y destinatario.
+  p2p: mensajes de aplicacion cifrados con clave derivada del codigo de sala; huella TOFU por nick;
+       rate limit por remitente en recepcion.
+`
+
+const relayHelpText = `brinco relay — Relay TCP propio (modo room relay)
+
+USO
+  brinco relay serve [flags]
+
+FLAGS
+  --listen string    Direccion local a escuchar (default: 0.0.0.0:10000)
+  --public string    host:puerto publico que recibiran los clientes (obligatorio si listen es 0.0.0.0)
+
+FLUJO TIPICO
+  1) En la maquina publica: brinco relay serve --listen 0.0.0.0:10000 --public TU_IP:10000
+  2) Creador: brinco room create --mode relay --relay TU_IP:10000 --password CLAVE --name host
+  3) Invitados: brinco room join --code relay-... --password CLAVE --name invitado
+
+El relay propio es opcional para p2p/guaranteed (ahi se usa la red libp2p/IPFS).
+`
+
+const updateHelpText = `brinco update — Actualizador (GitHub Releases: yerlinson10/Brinco-CLI)
+
+USO
+  brinco update check     Compara version local con la ultima release en GitHub
+  brinco update apply     Descarga el zip/tar.gz para tu GOOS/GOARCH, verifica checksums.txt
+                          si esta publicado, y reemplaza el binario (Unix) o deja .exe.new (Windows)
+
+REQUISITOS
+  Salida a Internet para api.github.com y descarga de assets.
+
+NOTA
+  La version embebida en el CLI es la constante interna; alinear tags de release con releases reales.
+`
+
 func Run(args []string) int {
 	logx.Init()
 	if len(args) == 0 {
-		printHelp()
+		printMainHelp()
 		return 0
 	}
 
 	switch args[0] {
 	case "help", "-h", "--help":
-		printHelp()
+		printMainHelp()
 		return 0
 	case "version", "-v", "--version":
 		fmt.Printf("brinco-cli %s\n", version)
 		return 0
 	case "relay":
 		return runRelay(args[1:])
+	case "update":
+		return runUpdate(args[1:])
 	case "room":
 		return runRoom(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Comando no reconocido: %s\n\n", args[0])
-		printHelp()
+		printMainHelp()
 		return 1
 	}
 }
@@ -165,14 +284,47 @@ func runRelay(args []string) int {
 	}
 }
 
-func printHelp() {
-	fmt.Println("brinco-cli v" + version + " - Chat P2P/Relay\n\nUso:\n  brinco <comando> [argumentos]\n\nComandos:\n  room create       Crea sala\n  room join         Se une a sala por codigo\n  room code         Muestra ultimo codigo de sala\n  relay serve       Levanta relay TCP propio\n  version           Muestra la version\n  help              Muestra esta ayuda\n\nCodigos de sala:\n  p2p-<...> direct-<...> relay-<...> guaranteed-<...>\n\nLogs:\n  Archivo en cache de usuario: brinco-cli/logs/brinco.log")
+func printMainHelp() {
+	fmt.Printf(mainHelpText, version)
 }
 
 func printRoomHelp() {
-	fmt.Println("Uso:\n  brinco room <subcomando> [flags]\n\nSubcomandos:\n  create    Crea sala y entra al chat\n  join      Se une a sala usando codigo\n  code      Muestra el ultimo codigo guardado\n  help      Muestra esta ayuda\n\ncreate flags:\n  --name       Nombre visible (default: host)\n  --mode       p2p | direct | relay | guaranteed (default: p2p)\n  --relay      Relay propio\n  --password   Requerido en direct/relay/guaranteed\n  --direct     Atajo legacy para mode=direct\n\njoin flags:\n  --name       Nombre visible (default: guest)\n  --code       Codigo de sala (obligatorio)\n  --mode       auto | p2p | direct | relay | guaranteed (default: auto)\n  --relay      Relay para p2p\n  --password   Requerido en direct/relay/guaranteed\n  --direct     Atajo legacy para mode=direct\n\nDentro del chat:\n  /code  /peers  /quit  /help")
+	fmt.Print(roomHelpText)
 }
 
 func printRelayHelp() {
-	fmt.Println("Uso:\n  brinco relay serve [flags]\n\nFlags:\n  --listen   Direccion local (default: 0.0.0.0:10000)\n  --public   Direccion publica host:puerto\n\nNota: el relay propio es OPCIONAL.\nSin el, brinco usa la red publica libp2p/IPFS gratuitamente.")
+	fmt.Print(relayHelpText)
+}
+
+func printUpdateHelp() {
+	fmt.Print(updateHelpText)
+}
+
+func runUpdate(args []string) int {
+	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		printUpdateHelp()
+		return 0
+	}
+	if args[0] == "check" {
+		latest, available, err := updater.Check(version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error verificando updates: %v\n", err)
+			return 1
+		}
+		if !available {
+			fmt.Println("Sin actualizaciones disponibles.")
+			return 0
+		}
+		fmt.Printf("Nueva version disponible: %s (actual %s)\n", latest, version)
+		return 0
+	}
+	if args[0] == "apply" {
+		if err := updater.Apply(version); err != nil {
+			fmt.Fprintf(os.Stderr, "Error aplicando update: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "Subcomando update no reconocido: %s (usa: brinco update help)\n", args[0])
+	return 1
 }

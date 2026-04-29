@@ -2,14 +2,18 @@ package p2p
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +26,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -37,11 +42,20 @@ var defaultBootstrapPeers = []string{
 }
 
 type chatMessage struct {
-	ID   string `json:"id,omitempty"`
-	From string `json:"from"`
-	Text string `json:"text"`
-	Type string `json:"type"` // chat | system
-	At   int64  `json:"at"`
+	ID          string `json:"id,omitempty"`
+	From        string `json:"from"`
+	Text        string `json:"text"`
+	Type        string `json:"type"` // chat | system | private | reaction | file
+	At          int64  `json:"at"`
+	To          string `json:"to,omitempty"`
+	FileName    string `json:"fileName,omitempty"`
+	FilePayload string `json:"filePayload,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
+
+type encryptedMessage struct {
+	Nonce  string `json:"nonce"`
+	Cipher string `json:"cipher"`
 }
 
 type roomCodePayload struct {
@@ -63,6 +77,14 @@ type Node struct {
 
 	seenMu   sync.Mutex
 	seenMsgs map[string]time.Time
+
+	statusMu         sync.RWMutex
+	connectivity     string
+	lastConnectivity time.Time
+	peerFingerprints map[string]string
+	rate             map[string]*peerRate
+	roomCode         string
+	roomSecret       [32]byte
 }
 
 // NewNodeGuaranteed crea un nodo libp2p que usa el DHT de la red IPFS para
@@ -152,7 +174,9 @@ func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, er
 		return nil, fmt.Errorf("error creando pubsub: %w", err)
 	}
 
-	return &Node{host: h, ps: ps, ctx: retx, cancel: cancel, seenMsgs: make(map[string]time.Time)}, nil
+	n := &Node{host: h, ps: ps, ctx: retx, cancel: cancel, seenMsgs: make(map[string]time.Time), peerFingerprints: make(map[string]string), rate: make(map[string]*peerRate)}
+	n.setConnectivity("connected")
+	return n, nil
 }
 
 // NewNode crea un nodo libp2p con relay circuit habilitado
@@ -194,7 +218,9 @@ func NewNode(ctx context.Context, relayAddrs []string) (*Node, error) {
 		return nil, fmt.Errorf("error creando pubsub: %w", err)
 	}
 
-	return &Node{host: h, ps: ps, ctx: ctx, cancel: cancel, seenMsgs: make(map[string]time.Time)}, nil
+	n := &Node{host: h, ps: ps, ctx: ctx, cancel: cancel, seenMsgs: make(map[string]time.Time), peerFingerprints: make(map[string]string), rate: make(map[string]*peerRate)}
+	n.setConnectivity("connected")
+	return n, nil
 }
 
 // Bootstrap conecta a la red via nodos publicos de IPFS y descubrimiento mDNS
@@ -266,9 +292,16 @@ func (n *Node) Publish(text string, msgType string) error {
 }
 
 func (n *Node) publishMessage(msg chatMessage) error {
-	raw, err := json.Marshal(msg)
+	rawPlain, err := json.Marshal(msg)
 	if err != nil {
 		return err
+	}
+	raw := rawPlain
+	if msg.Type != "system" {
+		raw, err = n.encryptPayload(rawPlain)
+		if err != nil {
+			return err
+		}
 	}
 	return n.topic.Publish(n.ctx, raw)
 }
@@ -288,6 +321,11 @@ func (n *Node) SetName(name string) {
 
 func (n *Node) SetRoomPeers(peers []string) {
 	n.roomPeers = append([]string(nil), peers...)
+}
+
+func (n *Node) SetRoomCode(code string) {
+	n.roomCode = strings.TrimSpace(code)
+	n.roomSecret = sha256.Sum256([]byte(n.roomCode))
 }
 
 // Close cierra el nodo
@@ -404,6 +442,8 @@ func RandomTopic() (string, error) {
 
 // RunChat entra al chat interactivo de la sala
 func (n *Node) RunChat(roomCode string) int {
+	n.SetRoomCode(roomCode)
+	go n.reconnectLoop()
 	go n.receiveLoop()
 
 	fmt.Println("Conectado al topic de la sala")
@@ -411,7 +451,7 @@ func (n *Node) RunChat(roomCode string) int {
 		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -430,17 +470,37 @@ func (n *Node) RunChat(roomCode string) int {
 			continue
 		}
 
+		if isReaction(line) {
+			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			continue
+		}
+
 		if strings.HasPrefix(line, "/") {
-			switch line {
-			case "/quit":
+			switch {
+			case line == "/quit":
 				_ = n.Publish(n.name+" salio", "system")
 				return 0
-			case "/code":
+			case line == "/code":
 				fmt.Printf("Codigo de sala: %s\n", roomCode)
-			case "/peers":
+			case line == "/peers":
 				fmt.Printf("Peers enlazados al topic: %d\n", n.TopicPeerCount())
-			case "/help":
-				fmt.Println("Comandos: /code /peers /quit /help")
+			case line == "/diag":
+				n.printDiag()
+			case line == "/help":
+				fmt.Println("Comandos: /code /peers /diag /msg <usuario> <texto> /send <archivo> /quit /help")
+			case strings.HasPrefix(line, "/msg "):
+				to, text, ok := parsePrivate(line)
+				if !ok {
+					fmt.Println("Uso: /msg <usuario> <texto>")
+					continue
+				}
+				if err := n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}); err != nil {
+					fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
+				}
+			case strings.HasPrefix(line, "/send "):
+				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
+					fmt.Fprintf(os.Stderr, "Error enviando archivo: %v\n", err)
+				}
 			default:
 				fmt.Println("Comando no reconocido. Usa /help")
 			}
@@ -454,10 +514,11 @@ func (n *Node) RunChat(roomCode string) int {
 }
 
 func (n *Node) publishChatReliable(text string) error {
-	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix()}
+	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
 	var lastErr error
 	for i := 0; i < 80; i++ {
 		if n.TopicPeerCount() == 0 && len(n.roomPeers) > 0 {
+			n.setConnectivity("reconnecting")
 			n.ConnectToPeers(n.roomPeers)
 		}
 		if err := n.publishMessage(msg); err != nil {
@@ -466,8 +527,10 @@ func (n *Node) publishChatReliable(text string) error {
 			continue
 		}
 		renderMessage(msg)
+		n.setConnectivity("connected")
 		return nil
 	}
+	n.setConnectivity("degraded")
 	if lastErr != nil {
 		return lastErr
 	}
@@ -487,13 +550,75 @@ func (n *Node) receiveLoop() {
 		}
 		var cm chatMessage
 		if err := json.Unmarshal(msg.Data, &cm); err != nil {
+			plain, derr := n.decryptPayload(msg.Data)
+			if derr != nil {
+				continue
+			}
+			if err := json.Unmarshal(plain, &cm); err != nil {
+				continue
+			}
+		}
+		if cm.From != "" && !n.allowPeer(cm.From) {
+			continue
+		}
+		if cm.Fingerprint != "" && !n.trackFingerprint(cm.From, cm.Fingerprint) {
+			fmt.Printf("[seguridad] fingerprint cambio para %s, posible suplantacion\n", cm.From)
 			continue
 		}
 		if !n.markSeen(cm.ID) {
 			continue
 		}
+		if cm.To != "" && cm.To != n.name && cm.From != n.name {
+			continue
+		}
+		n.setConnectivity("connected")
 		renderMessage(cm)
 	}
+}
+
+func (n *Node) encryptPayload(plain []byte) ([]byte, error) {
+	block, err := aes.NewCipher(n.roomSecret[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	cipherText := gcm.Seal(nil, nonce, plain, nil)
+	env := encryptedMessage{
+		Nonce:  base64.StdEncoding.EncodeToString(nonce),
+		Cipher: base64.StdEncoding.EncodeToString(cipherText),
+	}
+	return json.Marshal(env)
+}
+
+func (n *Node) decryptPayload(raw []byte) ([]byte, error) {
+	var env encryptedMessage
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, err
+	}
+	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+	if err != nil {
+		return nil, err
+	}
+	cipherText, err := base64.StdEncoding.DecodeString(env.Cipher)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(n.roomSecret[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return gcm.Open(nil, nonce, cipherText, nil)
 }
 
 func (n *Node) markSeen(id string) bool {
@@ -529,7 +654,212 @@ func renderMessage(msg chatMessage) {
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 	case "chat":
 		fmt.Printf("[%s] %s: %s\n", t, colorizeName(msg.From), msg.Text)
+	case "private":
+		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, colorizeName(msg.From), colorizeName(msg.To), msg.Text)
+	case "reaction":
+		fmt.Printf("[%s] %s reacciono %s\n", t, colorizeName(msg.From), msg.Text)
+	case "file":
+		path, size, err := saveIncomingP2PFile(msg)
+		if err != nil {
+			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, colorizeName(msg.From), msg.FileName, err)
+		} else {
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, colorizeName(msg.From), msg.FileName, size, path)
+		}
 	}
+}
+
+func (n *Node) reconnectLoop() {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+			if n.TopicPeerCount() > 0 || len(n.roomPeers) == 0 {
+				continue
+			}
+			n.setConnectivity("reconnecting")
+			n.ConnectToPeersWithRetry(n.roomPeers, 2, 500*time.Millisecond)
+			if n.TopicPeerCount() == 0 {
+				n.setConnectivity("degraded")
+			}
+		}
+	}
+}
+
+func (n *Node) setConnectivity(state string) {
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
+	n.connectivity = state
+	n.lastConnectivity = time.Now()
+}
+
+func (n *Node) connectivityState() string {
+	n.statusMu.RLock()
+	defer n.statusMu.RUnlock()
+	if strings.TrimSpace(n.connectivity) == "" {
+		return "connected"
+	}
+	return n.connectivity
+}
+
+func (n *Node) printDiag() {
+	relay := "no"
+	for _, addr := range n.host.Addrs() {
+		if strings.Contains(addr.String(), "p2p-circuit") {
+			relay = "si"
+			break
+		}
+	}
+	nat := "desconocido"
+	for _, addr := range n.host.Addrs() {
+		s := addr.String()
+		if strings.Contains(s, "/ip4/10.") || strings.Contains(s, "/ip4/192.168.") || strings.Contains(s, "/ip4/172.") {
+			nat = "probablemente detras de NAT"
+			break
+		}
+	}
+	if nat == "desconocido" && len(n.host.Addrs()) > 0 {
+		nat = "posible publico"
+	}
+	fmt.Printf("Estado: %s\nPeers topic: %d\nRelay activo: %s\nNAT: %s\n", n.connectivityState(), n.TopicPeerCount(), relay, nat)
+	for _, pid := range n.ps.ListPeers(n.topic.String()) {
+		res := <-ping.Ping(n.ctx, n.host, pid)
+		fmt.Printf("- %s RTT=%s\n", pid.String(), res.RTT)
+	}
+}
+
+func (n *Node) fingerprint() string {
+	sum := sha256.Sum256([]byte(n.host.ID().String()))
+	return hex.EncodeToString(sum[:8])
+}
+
+func (n *Node) trackFingerprint(name, fp string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
+	prev, ok := n.peerFingerprints[name]
+	if !ok {
+		n.peerFingerprints[name] = fp
+		return true
+	}
+	return prev == fp
+}
+
+type peerRate struct {
+	tokens float64
+	last   time.Time
+}
+
+func (n *Node) allowPeer(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
+	pr := n.rate[name]
+	if pr == nil {
+		pr = &peerRate{tokens: 10, last: time.Now()}
+		n.rate[name] = pr
+	}
+	now := time.Now()
+	pr.tokens += now.Sub(pr.last).Seconds() * 5
+	if pr.tokens > 10 {
+		pr.tokens = 10
+	}
+	pr.last = now
+	if pr.tokens < 1 {
+		return false
+	}
+	pr.tokens--
+	return true
+}
+
+func parsePrivate(line string) (string, string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(line, "/msg ")), " ", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
+}
+
+func isReaction(line string) bool {
+	v := strings.TrimSpace(line)
+	if strings.HasPrefix(v, ":") && strings.HasSuffix(v, ":") && len(v) > 2 {
+		return true
+	}
+	return v == "+1" || v == "-1" || v == "ok"
+}
+
+func (n *Node) sendFile(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 1_500_000 {
+		return fmt.Errorf("archivo excede 1.5MB")
+	}
+	name := path
+	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
+		name = path[idx+1:]
+	}
+	return n.publishMessage(chatMessage{
+		ID:          newMessageID(),
+		From:        n.name,
+		Type:        "file",
+		At:          time.Now().Unix(),
+		FileName:    name,
+		FilePayload: base64.StdEncoding.EncodeToString(raw),
+		Fingerprint: n.fingerprint(),
+	})
+}
+
+func saveIncomingP2PFile(msg chatMessage) (string, int, error) {
+	raw, err := base64.StdEncoding.DecodeString(msg.FilePayload)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(raw) > 1_500_000 {
+		return "", 0, fmt.Errorf("archivo recibido excede limite")
+	}
+	name := sanitizeP2PFileName(msg.FileName)
+	if name == "" {
+		name = "archivo.bin"
+	}
+	dir, err := p2pDownloadDir()
+	if err != nil {
+		return "", 0, err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("brinco-%d-%s", time.Now().Unix(), name))
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", 0, err
+	}
+	return path, len(raw), nil
+}
+
+func p2pDownloadDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		downloads := filepath.Join(home, "Downloads")
+		if st, serr := os.Stat(downloads); serr == nil && st.IsDir() {
+			return downloads, nil
+		}
+	}
+	return os.Getwd()
+}
+
+func sanitizeP2PFileName(name string) string {
+	n := filepath.Base(strings.TrimSpace(name))
+	n = strings.ReplaceAll(n, ":", "_")
+	n = strings.ReplaceAll(n, "\\", "_")
+	n = strings.ReplaceAll(n, "/", "_")
+	if n == "." || n == "" {
+		return ""
+	}
+	return n
 }
 
 func colorizeName(name string) string {
