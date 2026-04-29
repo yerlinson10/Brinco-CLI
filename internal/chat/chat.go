@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"net"
 	"os"
 	"path/filepath"
@@ -45,6 +44,21 @@ const (
 	lastRoomCodeFile = "brinco-last-room-code.txt"
 )
 
+var (
+	nickColorCodes   = []string{
+		"38;5;220", "38;5;226", "38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
+		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
+		"38;5;190", "38;5;214", "38;5;208", "38;5;202",
+		"38;5;196", "38;5;197", "38;5;198", "38;5;199", "38;5;200", "38;5;201",
+		"38;5;129", "38;5;135", "38;5;141", "38;5;147", "38;5;153", "38;5;159",
+		"38;5;123", "38;5;87", "38;5;81", "38;5;75", "38;5;69", "38;5;63",
+		"38;5;57", "38;5;93", "38;5;99", "38;5;105", "38;5;111", "38;5;117",
+	}
+	nickColorMu      sync.Mutex
+	nickColorByName  = map[string]string{}
+	nextNickColorIdx int
+)
+
 type roomCodePayload struct {
 	Mode  string `json:"mode,omitempty"`
 	Addr  string `json:"addr,omitempty"`
@@ -53,28 +67,28 @@ type roomCodePayload struct {
 }
 
 type wireMessage struct {
-	Type  string   `json:"type"`
-	Room  string   `json:"room,omitempty"`
-	From  string   `json:"from,omitempty"`
-	To    string   `json:"to,omitempty"`
-	Text  string   `json:"text,omitempty"`
-	Peers []string `json:"peers,omitempty"`
-	Code  string   `json:"code,omitempty"`
-	FileName    string `json:"fileName,omitempty"`
-	FilePayload string `json:"filePayload,omitempty"`
-	State       string `json:"state,omitempty"`
-	RTTMs       int64  `json:"rttMs,omitempty"`
-	RelayUsed   bool   `json:"relayUsed,omitempty"`
-	NATEst      string `json:"natEst,omitempty"`
+	Type        string   `json:"type"`
+	Room        string   `json:"room,omitempty"`
+	From        string   `json:"from,omitempty"`
+	To          string   `json:"to,omitempty"`
+	Text        string   `json:"text,omitempty"`
+	Peers       []string `json:"peers,omitempty"`
+	Code        string   `json:"code,omitempty"`
+	FileName    string   `json:"fileName,omitempty"`
+	FilePayload string   `json:"filePayload,omitempty"`
+	State       string   `json:"state,omitempty"`
+	RTTMs       int64    `json:"rttMs,omitempty"`
+	RelayUsed   bool     `json:"relayUsed,omitempty"`
+	NATEst      string   `json:"natEst,omitempty"`
 	// Assigned es el nombre final en sala (tras uniqueName); solo en welcome.
 	Assigned string `json:"assigned,omitempty"`
 	At       int64  `json:"at"`
 }
 
 type serverClient struct {
-	name string
-	conn net.Conn
-	send chan wireMessage
+	name   string
+	conn   net.Conn
+	send   chan wireMessage
 	last   time.Time
 	tokens float64
 }
@@ -373,12 +387,12 @@ func (s *roomServer) handleConn(conn net.Conn) {
 	s.addClient(client)
 
 	sendDirect(client, wireMessage{
-		Type:  msgTypeWelcome,
-		Text:  "Conectado a la sala",
-		Code:  s.code,
-		Peers: s.peerNames(),
+		Type:     msgTypeWelcome,
+		Text:     "Conectado a la sala",
+		Code:     s.code,
+		Peers:    s.peerNames(),
 		Assigned: client.name,
-		At:    time.Now().Unix(),
+		At:       time.Now().Unix(),
 	})
 	s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, nil)
 
@@ -555,21 +569,33 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
+	myNick := strings.TrimSpace(name)
+	if myNick == "" {
+		myNick = "guest"
+	}
+	var nickMu sync.RWMutex
 
 	go func() {
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
-		var myNick string
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
 				continue
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
+				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)
+				nickMu.Unlock()
 			}
-			renderWireMessage(msg, myNick)
+			nickMu.RLock()
+			currentNick := myNick
+			nickMu.RUnlock()
+			if shouldSkipOwnEcho(msg, currentNick) {
+				continue
+			}
+			renderWireMessage(msg, currentNick)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
@@ -577,7 +603,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	}()
 
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -628,7 +654,9 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					fmt.Println("No hay codigo disponible en esta sesion")
 				}
 			case "/help":
-				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u t | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u t | /send archivo /quit /help")
+			case "/clear":
+				clearConsole()
 			default:
 				if strings.HasPrefix(line, "/msg ") {
 					to, text, ok := parsePrivateCommand(line)
@@ -651,10 +679,15 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			continue
 		}
 
-		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: time.Now().Unix()}); err != nil {
+		at := time.Now().Unix()
+		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: at}); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enviando mensaje: %v\n", err)
 			return 1
 		}
+		nickMu.RLock()
+		currentNick := myNick
+		nickMu.RUnlock()
+		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick)
 	}
 }
 
@@ -734,6 +767,8 @@ func runWithReconnect(runOnce func() int) int {
 
 func renderWireMessage(msg wireMessage, myNick string) {
 	t := time.Unix(msg.At, 0).Format("15:04:05")
+	fromLabel := displayNick(msg.From, myNick)
+	toLabel := displayNick(msg.To, myNick)
 	switch msg.Type {
 	case msgTypeWelcome:
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
@@ -755,22 +790,52 @@ func renderWireMessage(msg wireMessage, myNick string) {
 	case msgTypeDiag:
 		fmt.Printf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s\n", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)
 	case msgTypeChat:
-		fmt.Printf("[%s] %s: %s\n", t, colorizeName(msg.From), msg.Text)
+		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
 	case msgTypePrivate:
 		if myNick != "" && msg.To != myNick && msg.From != myNick {
 			return
 		}
-		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, colorizeName(msg.From), colorizeName(msg.To), msg.Text)
+		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
 	case msgTypeReaction:
-		fmt.Printf("[%s] %s reacciono %s\n", t, colorizeName(msg.From), msg.Text)
+		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
 	case msgTypeFile:
 		path, size, err := saveIncomingFile(msg)
 		if err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, colorizeName(msg.From), msg.FileName, err)
+			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
 		} else {
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, colorizeName(msg.From), msg.FileName, size, path)
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
 		}
 	}
+}
+
+func displayNick(nick, myNick string) string {
+	n := strings.TrimSpace(nick)
+	if n == "" {
+		return colorizeName(nick)
+	}
+	label := n
+	if n == strings.TrimSpace(myNick) {
+		label = n + " (tu)"
+	}
+	return colorizeName(label)
+}
+
+func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
+	mine := strings.TrimSpace(myNick)
+	from := strings.TrimSpace(msg.From)
+	if mine == "" || from == "" || from != mine {
+		return false
+	}
+	switch msg.Type {
+	case msgTypeChat, msgTypePrivate, msgTypeReaction, msgTypeFile:
+		return true
+	default:
+		return false
+	}
+}
+
+func clearConsole() {
+	fmt.Print("\033[2J\033[H")
 }
 
 func parseAtMention(line string) (to, text string, ok bool) {
@@ -876,11 +941,19 @@ func colorizeName(name string) string {
 	if !supportsColor() {
 		return name
 	}
-	colors := []string{"31", "32", "33", "34", "35", "36", "91", "92", "93", "94", "95", "96"}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(name))
-	idx := int(h.Sum32()) % len(colors)
-	return "\x1b[" + colors[idx] + "m" + name + "\x1b[0m"
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return name
+	}
+	nickColorMu.Lock()
+	code, ok := nickColorByName[key]
+	if !ok {
+		code = nickColorCodes[nextNickColorIdx%len(nickColorCodes)]
+		nextNickColorIdx++
+		nickColorByName[key] = code
+	}
+	nickColorMu.Unlock()
+	return "\x1b[" + code + "m" + name + "\x1b[0m"
 }
 
 func colorizeSystem(text string) string {

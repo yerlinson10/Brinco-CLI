@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,6 +85,21 @@ type Node struct {
 	roomCode         string
 	roomSecret       [32]byte
 }
+
+var (
+	nickColorCodesP2P   = []string{
+		"38;5;220", "38;5;226", "38;5;33", "38;5;39", "38;5;45", "38;5;51", "38;5;50", "38;5;49",
+		"38;5;48", "38;5;47", "38;5;46", "38;5;82", "38;5;118", "38;5;154",
+		"38;5;190", "38;5;214", "38;5;208", "38;5;202",
+		"38;5;196", "38;5;197", "38;5;198", "38;5;199", "38;5;200", "38;5;201",
+		"38;5;129", "38;5;135", "38;5;141", "38;5;147", "38;5;153", "38;5;159",
+		"38;5;123", "38;5;87", "38;5;81", "38;5;75", "38;5;69", "38;5;63",
+		"38;5;57", "38;5;93", "38;5;99", "38;5;105", "38;5;111", "38;5;117",
+	}
+	nickColorMuP2P      sync.Mutex
+	nickColorByNameP2P  = map[string]string{}
+	nextNickColorIdxP2P int
+)
 
 // NewNodeGuaranteed crea un nodo libp2p que usa el DHT de la red IPFS para
 // descubrir relays circuit v2 automaticamente. Fuerza reachability privada para
@@ -451,7 +465,7 @@ func (n *Node) RunChat(roomCode string) int {
 		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -492,7 +506,9 @@ func (n *Node) RunChat(roomCode string) int {
 			case line == "/diag":
 				n.printDiag()
 			case line == "/help":
-				fmt.Println("Comandos: /code /peers /diag @usuario mensaje | /msg u texto | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+			case line == "/clear":
+				clearConsoleP2P()
 			case strings.HasPrefix(line, "/msg "):
 				to, text, ok := parsePrivate(line)
 				if !ok {
@@ -531,7 +547,7 @@ func (n *Node) publishChatReliable(text string) error {
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		renderMessage(msg)
+		renderMessage(msg, n.name)
 		n.setConnectivity("connected")
 		return nil
 	}
@@ -577,7 +593,7 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 		n.setConnectivity("connected")
-		renderMessage(cm)
+		renderMessage(cm, n.name)
 	}
 }
 
@@ -652,25 +668,43 @@ func (n *Node) markSeen(id string) bool {
 
 // --- Helpers de render ---
 
-func renderMessage(msg chatMessage) {
+func renderMessage(msg chatMessage, myNick string) {
 	t := time.Unix(msg.At, 0).Format("15:04:05")
+	fromLabel := displayNickP2P(msg.From, myNick)
+	toLabel := displayNickP2P(msg.To, myNick)
 	switch msg.Type {
 	case "system":
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 	case "chat":
-		fmt.Printf("[%s] %s: %s\n", t, colorizeName(msg.From), msg.Text)
+		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
 	case "private":
-		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, colorizeName(msg.From), colorizeName(msg.To), msg.Text)
+		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
 	case "reaction":
-		fmt.Printf("[%s] %s reacciono %s\n", t, colorizeName(msg.From), msg.Text)
+		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
 	case "file":
 		path, size, err := saveIncomingP2PFile(msg)
 		if err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, colorizeName(msg.From), msg.FileName, err)
+			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
 		} else {
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, colorizeName(msg.From), msg.FileName, size, path)
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
 		}
 	}
+}
+
+func displayNickP2P(nick, myNick string) string {
+	n := strings.TrimSpace(nick)
+	if n == "" {
+		return colorizeName(nick)
+	}
+	label := n
+	if n == strings.TrimSpace(myNick) {
+		label = n + " (tu)"
+	}
+	return colorizeName(label)
+}
+
+func clearConsoleP2P() {
+	fmt.Print("\033[2J\033[H")
 }
 
 func (n *Node) reconnectLoop() {
@@ -889,11 +923,19 @@ func colorizeName(name string) string {
 	if !supportsColor() {
 		return name
 	}
-	colors := []string{"31", "32", "33", "34", "35", "36", "91", "92", "93", "94", "95", "96"}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(name))
-	idx := int(h.Sum32()) % len(colors)
-	return "\x1b[" + colors[idx] + "m" + name + "\x1b[0m"
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return name
+	}
+	nickColorMuP2P.Lock()
+	code, ok := nickColorByNameP2P[key]
+	if !ok {
+		code = nickColorCodesP2P[nextNickColorIdxP2P%len(nickColorCodesP2P)]
+		nextNickColorIdxP2P++
+		nickColorByNameP2P[key] = code
+	}
+	nickColorMuP2P.Unlock()
+	return "\x1b[" + code + "m" + name + "\x1b[0m"
 }
 
 func colorizeSystem(text string) string {
