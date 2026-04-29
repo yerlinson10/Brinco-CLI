@@ -485,12 +485,16 @@ func (n *Node) RunChat(roomCode string) int {
 		}
 
 		if isReaction(line) {
-			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			_ = n.publishMessage(reactionMsg)
+			renderMessage(reactionMsg, n.name)
 			continue
 		}
 
 		if to, txt, ok := parseAtMentionP2P(line); ok {
-			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
+			pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			_ = n.publishMessage(pmMsg)
+			renderMessage(pmMsg, n.name)
 			continue
 		}
 
@@ -515,8 +519,11 @@ func (n *Node) RunChat(roomCode string) int {
 					fmt.Println("Uso: /msg <usuario> <texto>")
 					continue
 				}
-				if err := n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}); err != nil {
+				pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+				if err := n.publishMessage(pmMsg); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
+				} else {
+					renderMessage(pmMsg, n.name)
 				}
 			case strings.HasPrefix(line, "/send "):
 				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
@@ -696,11 +703,11 @@ func displayNickP2P(nick, myNick string) string {
 	if n == "" {
 		return colorizeName(nick)
 	}
-	label := n
+	label := colorizeName(n)
 	if n == strings.TrimSpace(myNick) {
-		label = n + " (tu)"
+		return label + " (tu)"
 	}
-	return colorizeName(label)
+	return label
 }
 
 func clearConsoleP2P() {
@@ -863,7 +870,7 @@ func (n *Node) sendFile(path string) error {
 	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
 		name = path[idx+1:]
 	}
-	return n.publishMessage(chatMessage{
+	msg := chatMessage{
 		ID:          newMessageID(),
 		From:        n.name,
 		Type:        "file",
@@ -871,7 +878,13 @@ func (n *Node) sendFile(path string) error {
 		FileName:    name,
 		FilePayload: base64.StdEncoding.EncodeToString(raw),
 		Fingerprint: n.fingerprint(),
-	})
+	}
+	if err := n.publishMessage(msg); err != nil {
+		return err
+	}
+	t := time.Unix(msg.At, 0).Format("15:04:05")
+	fmt.Printf("[%s] %s envio archivo %s (%d bytes)\n", t, displayNickP2P(msg.From, n.name), msg.FileName, len(raw))
+	return nil
 }
 
 func saveIncomingP2PFile(msg chatMessage) (string, int, error) {

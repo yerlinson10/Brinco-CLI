@@ -813,11 +813,11 @@ func displayNick(nick, myNick string) string {
 	if n == "" {
 		return colorizeName(nick)
 	}
-	label := n
+	label := colorizeName(n)
 	if n == strings.TrimSpace(myNick) {
-		label = n + " (tu)"
+		return label + " (tu)"
 	}
-	return colorizeName(label)
+	return label
 }
 
 func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
@@ -827,7 +827,7 @@ func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
 		return false
 	}
 	switch msg.Type {
-	case msgTypeChat, msgTypePrivate, msgTypeReaction, msgTypeFile:
+	case msgTypeChat:
 		return true
 	default:
 		return false
