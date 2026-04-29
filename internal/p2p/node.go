@@ -465,9 +465,11 @@ func (n *Node) RunChat(roomCode string) int {
 		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
 	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
 	stdin := bufio.NewScanner(os.Stdin)
+	localLimiter := &peerRate{tokens: 8, last: time.Now()}
+	history := make([]string, 0, 50)
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -483,13 +485,30 @@ func (n *Node) RunChat(roomCode string) int {
 		if line == "" {
 			continue
 		}
+		if line == "!!" {
+			if len(history) == 0 {
+				fmt.Println("Historial vacio")
+				continue
+			}
+			line = history[len(history)-1]
+			fmt.Printf("repite: %s\n", line)
+		}
+		history = appendHistory(history, line, 40)
 
 		if isReaction(line) {
+			if !allowLocalP2P(localLimiter) {
+				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				continue
+			}
 			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
 			continue
 		}
 
 		if to, txt, ok := parseAtMentionP2P(line); ok {
+			if !allowLocalP2P(localLimiter) {
+				fmt.Println("Rate limit local: espera un momento para seguir enviando")
+				continue
+			}
 			_ = n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()})
 			continue
 		}
@@ -506,28 +525,44 @@ func (n *Node) RunChat(roomCode string) int {
 			case line == "/diag":
 				n.printDiag()
 			case line == "/help":
-				fmt.Println("Comandos: /code /peers /diag /clear @usuario mensaje | /msg u texto | /send archivo /quit /help")
+				fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 			case line == "/clear":
 				clearConsoleP2P()
+			case line == "/history":
+				printInputHistory(history)
 			case strings.HasPrefix(line, "/msg "):
 				to, text, ok := parsePrivate(line)
 				if !ok {
 					fmt.Println("Uso: /msg <usuario> <texto>")
 					continue
 				}
+				if !allowLocalP2P(localLimiter) {
+					fmt.Println("Rate limit local: espera un momento para seguir enviando")
+					continue
+				}
 				if err := n.publishMessage(chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
 				}
 			case strings.HasPrefix(line, "/send "):
+				if !allowLocalP2P(localLimiter) {
+					fmt.Println("Rate limit local: espera un momento para seguir enviando")
+					continue
+				}
 				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando archivo: %v\n", err)
 				}
+			case strings.HasPrefix(line, "/kick ") || strings.HasPrefix(line, "/mute ") || strings.HasPrefix(line, "/unmute ") || strings.HasPrefix(line, "/ban "):
+				fmt.Println("Moderacion host no disponible en modo p2p/guaranteed (sin servidor central).")
 			default:
 				fmt.Println("Comando no reconocido. Usa /help")
 			}
 			continue
 		}
 
+		if !allowLocalP2P(localLimiter) {
+			fmt.Println("Rate limit local: espera un momento para seguir enviando")
+			continue
+		}
 		if err := n.publishChatReliable(line); err != nil {
 			fmt.Fprintf(os.Stderr, "Error enviando: %v\n", err)
 		}
@@ -815,6 +850,45 @@ func (n *Node) allowPeer(name string) bool {
 	}
 	pr.tokens--
 	return true
+}
+
+func allowLocalP2P(pr *peerRate) bool {
+	now := time.Now()
+	pr.tokens += now.Sub(pr.last).Seconds() * 4
+	if pr.tokens > 8 {
+		pr.tokens = 8
+	}
+	pr.last = now
+	if pr.tokens < 1 {
+		return false
+	}
+	pr.tokens--
+	return true
+}
+
+func appendHistory(history []string, line string, max int) []string {
+	if strings.TrimSpace(line) == "" {
+		return history
+	}
+	history = append(history, line)
+	if len(history) > max {
+		history = history[len(history)-max:]
+	}
+	return history
+}
+
+func printInputHistory(history []string) {
+	if len(history) == 0 {
+		fmt.Println("Historial vacio")
+		return
+	}
+	start := 0
+	if len(history) > 20 {
+		start = len(history) - 20
+	}
+	for i := start; i < len(history); i++ {
+		fmt.Printf("%2d) %s\n", i-start+1, history[i])
+	}
 }
 
 func parseAtMentionP2P(line string) (to, text string, ok bool) {
