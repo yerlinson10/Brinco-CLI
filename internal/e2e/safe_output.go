@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const waitForOutputPollInterval = 120 * time.Millisecond
+
 // safeOutput acumula stdout/stderr de un exec.Cmd de forma segura entre
 // goroutines (el proceso hijo escribe mientras el test lee en waitForCtx).
 type safeOutput struct {
@@ -28,17 +30,24 @@ func (s *safeOutput) String() string {
 	return s.b.String()
 }
 
+func (s *safeOutput) Contains(needle string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Contains(s.b.String(), needle)
+}
+
 // waitForCtx espera hasta que out contenga needle o hasta que ctx expire.
 // Comparte el mismo deadline que exec.CommandContext para evitar flakes en CI.
 func waitForCtx(t *testing.T, ctx context.Context, out *safeOutput, needle string) {
 	t.Helper()
 	for {
+		snapshot := out.String()
 		if ctx.Err() != nil {
-			t.Fatalf("timeout esperando %q en salida (contexto): %v\n%s", needle, ctx.Err(), out.String())
+			t.Fatalf("timeout esperando %q en salida (contexto): %v\n%s", needle, ctx.Err(), snapshot)
 		}
-		if strings.Contains(out.String(), needle) {
+		if strings.Contains(snapshot, needle) {
 			return
 		}
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(waitForOutputPollInterval)
 	}
 }
