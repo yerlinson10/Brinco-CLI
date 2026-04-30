@@ -99,6 +99,12 @@ FLAGS
 
 const updateHelpText = `brinco update — GitHub Releases (yerlinson10/Brinco-CLI)
   brinco update check | apply | help
+
+  Variables de entorno (opcional):
+    BRINCO_UPDATE_PRERELEASE=1     usar el release con tag semver más alto (incluye pre-releases)
+    BRINCO_UPDATE_RELEASE_API=URL JSON de un solo release (sobrescribe la API por defecto)
+    BRINCO_UPDATE_REQUIRE_CHECKSUM=1  falla si no hay checksums.txt o no coincide
+    BRINCO_UPDATE_PROGRESS=1      muestra progreso de descarga en la consola
 `
 
 func Run(args []string) int {
