@@ -1,15 +1,20 @@
 ﻿package cli
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"brinco-cli/internal/chat"
 	"brinco-cli/internal/logx"
+	"brinco-cli/internal/notify"
 	p2pcmd "brinco-cli/internal/p2p"
 	"brinco-cli/internal/roomproto"
 	"brinco-cli/internal/updater"
@@ -63,6 +68,8 @@ room create / host
   --mode       p2p | direct | relay | guaranteed (default p2p)
   --relay      p2p: multiaddr libp2p opcional | relay: host:puerto TCP obligatorio
   --password, --pass   clave opcional; vacio = sala abierta (sin clave) en relay/direct
+  --notify-sound on|off, --notify-level all|direct|mentions|none
+  --file-limit 10MB     limite local para /send
   --direct     atajo a modo direct
   --listen, --public   solo direct
 
@@ -74,7 +81,7 @@ room join / join
 DENTRO DEL CHAT
   @usuario mensaje     privado (atajo de /msg)
   /msg usuario texto   privado
-  /send ruta           archivo (~1.5 MB)
+  /send ruta           archivo chunked con progreso/checksum
   /diag /peers /code /quit /help
   Reacciones en linea sola: +1  -1  ok  :emoji:
 `
@@ -109,7 +116,7 @@ func Run(args []string) int {
 		fmt.Printf("brinco-cli %s\n", version)
 		return 0
 	case "doctor":
-		return runDoctor()
+		return runDoctor(args[1:])
 	case "host":
 		return runHost(args[1:])
 	case "join":
@@ -138,7 +145,14 @@ func printMainHelp() {
 	fmt.Print(s)
 }
 
-func runDoctor() int {
+func runDoctor(args []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	verbose := fs.Bool("verbose", false, "Diagnostico extendido")
+	relay := fs.String("relay", "", "Relay(s) host:puerto separados por coma para probar")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
 	fmt.Printf("brinco-cli %s\n", version)
 	fmt.Printf("go %s  %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	if wd, err := os.Getwd(); err == nil {
@@ -157,7 +171,83 @@ func runDoctor() int {
 			fmt.Printf("profiles: %s (aun no existe; opcional)\n", p)
 		}
 	}
+	if !*verbose {
+		return 0
+	}
+	fmt.Println()
+	fmt.Println("Diagnostico verbose")
+	if p := logx.Path(); p != "" {
+		fmt.Printf("log: %s\n", p)
+	}
+	printDoctorNetwork()
+	relays := chat.SplitRelayList(*relay)
+	if len(relays) == 0 {
+		relays = relaysFromProfiles()
+	}
+	if len(relays) == 0 {
+		relays = []string{"127.0.0.1:10000"}
+	}
+	fmt.Println("relays:")
+	for _, result := range chat.ProbeTCPRelays(relays, 1200*time.Millisecond) {
+		if result.OK {
+			fmt.Printf("- %s ok rtt=%s\n", result.Addr, result.RTT.Round(time.Millisecond))
+		} else {
+			fmt.Printf("- %s fail err=%s\n", result.Addr, result.Message)
+		}
+	}
 	return 0
+}
+
+func printDoctorNetwork() {
+	fmt.Println("interfaces:")
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		fmt.Printf("- error: %v\n", err)
+		return
+	}
+	nat := "posible publico"
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			s := addr.String()
+			if strings.Contains(s, "10.") || strings.Contains(s, "192.168.") || strings.Contains(s, "172.") || strings.Contains(s, "fd") {
+				nat = "probablemente detras de NAT"
+			}
+			fmt.Printf("- %s %s\n", iface.Name, s)
+		}
+	}
+	fmt.Printf("nat: %s\n", nat)
+	fmt.Println("puertos comunes:")
+	for _, addr := range []string{"127.0.0.1:9090", "127.0.0.1:10000"} {
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err != nil {
+			fmt.Printf("- %s cerrado/no alcanzable\n", addr)
+			continue
+		}
+		_ = conn.Close()
+		fmt.Printf("- %s abierto rtt=%s\n", addr, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+func relaysFromProfiles() []string {
+	path, err := profilesPath()
+	if err != nil {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var all map[string]Profile
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return nil
+	}
+	var relays []string
+	for _, profile := range all {
+		relays = append(relays, chat.SplitRelayList(profile.Relay)...)
+	}
+	return uniqueStrings(relays)
 }
 
 func mergePass(a, b string) string {
@@ -177,6 +267,73 @@ func effectiveJoinMode(mode, code string) string {
 		return p
 	}
 	return "p2p"
+}
+
+type runtimeOptions struct {
+	NotifySound string
+	NotifyLevel string
+	FileLimit   string
+}
+
+func applyRuntimeOptions(opts runtimeOptions) {
+	sound := true
+	switch strings.ToLower(strings.TrimSpace(opts.NotifySound)) {
+	case "off", "false", "0", "no":
+		sound = false
+	}
+	level := strings.TrimSpace(opts.NotifyLevel)
+	if level == "" {
+		level = notify.LevelAll
+	}
+	notify.Configure(notify.Options{Sound: sound, Level: level, Throttle: 250 * time.Millisecond})
+	if limit, err := parseByteLimit(opts.FileLimit); err == nil && limit > 0 {
+		chat.SetMaxFileBytes(limit)
+		p2pcmd.SetMaxFileBytes(limit)
+	}
+}
+
+func parseByteLimit(value string) (int64, error) {
+	value = strings.TrimSpace(strings.ToUpper(value))
+	if value == "" {
+		return 0, nil
+	}
+	mult := int64(1)
+	for _, suffix := range []struct {
+		s string
+		m int64
+	}{
+		{"GB", 1024 * 1024 * 1024},
+		{"G", 1024 * 1024 * 1024},
+		{"MB", 1024 * 1024},
+		{"M", 1024 * 1024},
+		{"KB", 1024},
+		{"K", 1024},
+	} {
+		if strings.HasSuffix(value, suffix.s) {
+			mult = suffix.m
+			value = strings.TrimSpace(strings.TrimSuffix(value, suffix.s))
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, err
+	}
+	return int64(n * float64(mult)), nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func execRoomCreate(name, mode, relay string, direct bool, listen, public, password string) int {
@@ -240,6 +397,9 @@ func runHost(args []string) int {
 	public := fs.String("public", "", "[direct] Host:puerto publico")
 	password := fs.String("password", "", "Password de la sala")
 	pass := fs.String("pass", "", "Alias de --password")
+	notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
+	notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
+	fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -247,6 +407,7 @@ func runHost(args []string) int {
 		*mode = "direct"
 	}
 	pw := mergePass(*password, *pass)
+	applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
 	return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
 }
 
@@ -284,6 +445,9 @@ func runJoinShortcut(args []string) int {
 	direct := fs.Bool("direct", false, "Modo TCP directo")
 	password := fs.String("password", "", "Password")
 	pass := fs.String("pass", "", "Alias de --password")
+	notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
+	notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
+	fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
 	if err := fs.Parse(rest); err != nil {
 		return 1
 	}
@@ -307,6 +471,15 @@ func runJoinShortcut(args []string) int {
 	if strings.TrimSpace(prof.Password) != "" && pw == "" {
 		pw = prof.Password
 	}
+	if strings.TrimSpace(prof.NotifySound) != "" && *notifySound == "on" {
+		*notifySound = prof.NotifySound
+	}
+	if strings.TrimSpace(prof.NotifyLevel) != "" && *notifyLevel == "all" {
+		*notifyLevel = prof.NotifyLevel
+	}
+	if strings.TrimSpace(prof.FileLimit) != "" && *fileLimit == "10MB" {
+		*fileLimit = prof.FileLimit
+	}
 
 	if strings.TrimSpace(code) == "" {
 		var err error
@@ -317,6 +490,7 @@ func runJoinShortcut(args []string) int {
 		}
 	}
 
+	applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
 	return execRoomJoin(*name, code, *mode, relayVal, *direct, pw)
 }
 
@@ -341,6 +515,9 @@ func runRoom(args []string) int {
 		public := fs.String("public", "", "[--direct] Direccion publica host:puerto")
 		password := fs.String("password", "", "Password de la sala")
 		pass := fs.String("pass", "", "Alias de --password")
+		notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
+		notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
+		fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
@@ -348,6 +525,7 @@ func runRoom(args []string) int {
 			*mode = "direct"
 		}
 		pw := mergePass(*password, *pass)
+		applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
 		return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
 
 	case "join":
@@ -363,6 +541,9 @@ func runRoom(args []string) int {
 		direct := fs.Bool("direct", false, "Modo TCP directo")
 		password := fs.String("password", "", "Password de la sala")
 		pass := fs.String("pass", "", "Alias de --password")
+		notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
+		notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
+		fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 1
 		}
@@ -379,6 +560,7 @@ func runRoom(args []string) int {
 			}
 		}
 		pw := mergePass(*password, *pass)
+		applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
 		return execRoomJoin(*name, c, *mode, *relay, *direct, pw)
 
 	case "code":

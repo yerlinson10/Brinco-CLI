@@ -10,10 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os/exec"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +19,8 @@ import (
 
 	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
+	"brinco-cli/internal/notify"
+	"brinco-cli/internal/roomcode"
 	"brinco-cli/internal/roomproto"
 )
 
@@ -41,6 +41,7 @@ const (
 	msgTypeDiag       = "diag"
 	msgTypeModCmd     = "mod_cmd"
 	msgTypeHostUpdate = "host_update"
+	msgTypeFileChunk  = "file_chunk"
 
 	roomModeDirect     = "direct"
 	roomModeRelay      = "relay"
@@ -65,15 +66,17 @@ var (
 	nickColorMu      sync.Mutex
 	nickColorByName  = map[string]string{}
 	nextNickColorIdx int
-	notifyMu         sync.Mutex
-	lastNotifyAt     time.Time
+	maxFileBytes     int64 = 10 * 1024 * 1024
+	incomingFileMu         sync.Mutex
+	incomingFiles          = map[string]*incomingFileTransfer{}
 )
 
 type roomCodePayload struct {
-	Mode  string `json:"mode,omitempty"`
-	Addr  string `json:"addr,omitempty"`
-	Relay string `json:"relay,omitempty"`
-	Room  string `json:"room"`
+	Mode   string   `msgpack:"m,omitempty"`
+	Addr   string   `msgpack:"a,omitempty"`
+	Relay  string   `msgpack:"x,omitempty"`
+	Relays []string `msgpack:"y,omitempty"`
+	Room   string   `msgpack:"r"`
 }
 
 type wireMessage struct {
@@ -86,6 +89,12 @@ type wireMessage struct {
 	Code        string   `json:"code,omitempty"`
 	FileName    string   `json:"fileName,omitempty"`
 	FilePayload string   `json:"filePayload,omitempty"`
+	TransferID  string   `json:"transferId,omitempty"`
+	ChunkIndex  int      `json:"chunkIndex,omitempty"`
+	ChunkCount  int      `json:"chunkCount,omitempty"`
+	ChunkSize   int      `json:"chunkSize,omitempty"`
+	TotalSize   int64    `json:"totalSize,omitempty"`
+	Checksum    string   `json:"checksum,omitempty"`
 	State       string   `json:"state,omitempty"`
 	RTTMs       int64    `json:"rttMs,omitempty"`
 	RelayUsed   bool     `json:"relayUsed,omitempty"`
@@ -95,6 +104,22 @@ type wireMessage struct {
 	// Host es el nick del moderador de sala (mismo valor para todos los clientes).
 	Host string `json:"host,omitempty"`
 	At   int64  `json:"at"`
+}
+
+type incomingFileTransfer struct {
+	name        string
+	checksum    string
+	totalSize   int64
+	chunks      [][]byte
+	got         []bool
+	received    int
+	lastPercent int
+}
+
+func SetMaxFileBytes(limit int64) {
+	if limit > 0 {
+		maxFileBytes = limit
+	}
 }
 
 // roomHostTracker guarda el nick del host anunciado por el servidor (welcome / host_update).
@@ -213,8 +238,13 @@ func RunJoin(name, code, password string) int {
 	}
 
 	addr := payload.Addr
-	if strings.TrimSpace(payload.Relay) != "" {
-		addr = payload.Relay
+	relays := payload.relayCandidates()
+	if len(relays) > 0 {
+		best, results := SelectBestTCPRelay(relays, 900*time.Millisecond)
+		printRelayProbeResults(results)
+		if best != "" {
+			addr = best
+		}
 	}
 	roomID := payload.Room
 	mode := strings.TrimSpace(payload.Mode)
@@ -235,20 +265,21 @@ func RunJoin(name, code, password string) int {
 
 func BuildRoomCode(addr, room string) (string, error) {
 	payload := roomCodePayload{Mode: roomModeDirect, Addr: addr, Room: room}
-	raw, err := json.Marshal(payload)
+	encoded, err := roomcode.Encode(payload)
 	if err != nil {
 		return "", err
 	}
-	return roomproto.Wrap(roomproto.ProtocolDirect, base64.RawURLEncoding.EncodeToString(raw)), nil
+	return roomproto.Wrap(roomproto.ProtocolDirect, encoded), nil
 }
 
 func BuildRelayRoomCode(relayAddr, room string) (string, error) {
-	payload := roomCodePayload{Mode: roomModeRelay, Relay: relayAddr, Room: room}
-	raw, err := json.Marshal(payload)
+	relays := SplitRelayList(relayAddr)
+	payload := roomCodePayload{Mode: roomModeRelay, Relays: relays, Room: room}
+	encoded, err := roomcode.Encode(payload)
 	if err != nil {
 		return "", err
 	}
-	return roomproto.Wrap(roomproto.ProtocolRelay, base64.RawURLEncoding.EncodeToString(raw)), nil
+	return roomproto.Wrap(roomproto.ProtocolRelay, encoded), nil
 }
 
 func RewriteCodeProtocol(code, protocol string) string {
@@ -267,13 +298,8 @@ func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
 	if encoded == "" {
 		encoded = strings.TrimSpace(code)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return roomCodePayload{}, err
-	}
-
 	var rc roomCodePayload
-	if err := json.Unmarshal(raw, &rc); err != nil {
+	if err := roomcode.Decode(encoded, &rc); err != nil {
 		return roomCodePayload{}, err
 	}
 	if rc.Room == "" {
@@ -292,7 +318,7 @@ func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
 		}
 	}
 	if rc.Mode == roomModeRelay || rc.Mode == roomModeGuaranteed {
-		if strings.TrimSpace(rc.Relay) == "" {
+		if len(rc.relayCandidates()) == 0 {
 			return roomCodePayload{}, errors.New("codigo relay invalido")
 		}
 		return rc, nil
@@ -308,10 +334,18 @@ func ParseRoomCode(code string) (addr string, room string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	if strings.TrimSpace(payload.Relay) != "" {
-		return payload.Relay, payload.Room, nil
+	if relays := payload.relayCandidates(); len(relays) > 0 {
+		return relays[0], payload.Room, nil
 	}
 	return payload.Addr, payload.Room, nil
+}
+
+func (p roomCodePayload) relayCandidates() []string {
+	out := append([]string{}, p.Relays...)
+	if strings.TrimSpace(p.Relay) != "" {
+		out = append([]string{p.Relay}, out...)
+	}
+	return uniqueStrings(out)
 }
 
 func SaveLastRoomCode(code string) error {
@@ -501,10 +535,17 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 			s.broadcast(wireMessage{Type: msgTypeReaction, From: c.name, Text: msg.Text, At: time.Now().Unix()}, nil)
 		}
 	case msgTypeFile:
-		if strings.TrimSpace(msg.FileName) == "" || len(msg.FilePayload) > 2_200_000 {
+		if strings.TrimSpace(msg.FileName) == "" || int64(len(msg.FilePayload)) > maxFileBytes*2 {
 			return
 		}
 		s.broadcast(wireMessage{Type: msgTypeFile, From: c.name, FileName: msg.FileName, FilePayload: msg.FilePayload, At: time.Now().Unix()}, nil)
+	case msgTypeFileChunk:
+		if !validFileChunk(msg) {
+			return
+		}
+		msg.From = c.name
+		msg.At = time.Now().Unix()
+		s.broadcast(msg, nil)
 	case msgTypeQuit:
 		return
 	case msgTypeModCmd:
@@ -884,15 +925,12 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					}
 					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
 				} else if strings.HasPrefix(line, "/send ") {
-					msg, err := buildFileMessage(strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
-					if err != nil {
+					if !localLimiter.allow() {
+						printRateLimitLocal()
+						continue
+					}
+					if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
 						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
-					} else {
-						if !localLimiter.allow() {
-							printRateLimitLocal()
-							continue
-						}
-						_ = writeMessage(conn, msg)
 					}
 				} else {
 					fmt.Println("Comando no reconocido. Usa /help")
@@ -991,6 +1029,101 @@ func runWithReconnect(runOnce func() int) int {
 	return 1
 }
 
+type RelayProbeResult struct {
+	Addr    string
+	RTT     time.Duration
+	OK      bool
+	Message string
+}
+
+func SplitRelayList(value string) []string {
+	return uniqueStrings(strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';'
+	}))
+}
+
+func SelectBestTCPRelay(relays []string, timeout time.Duration) (string, []RelayProbeResult) {
+	results := ProbeTCPRelays(relays, timeout)
+	best := ""
+	var bestRTT time.Duration
+	for _, result := range results {
+		if !result.OK {
+			continue
+		}
+		if best == "" || result.RTT < bestRTT {
+			best = result.Addr
+			bestRTT = result.RTT
+		}
+	}
+	if best == "" && len(relays) > 0 {
+		best = relays[0]
+	}
+	return best, results
+}
+
+func ProbeTCPRelays(relays []string, timeout time.Duration) []RelayProbeResult {
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	relays = uniqueStrings(relays)
+	results := make([]RelayProbeResult, 0, len(relays))
+	for _, relay := range relays {
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", relay, timeout)
+		if err != nil {
+			results = append(results, RelayProbeResult{Addr: relay, OK: false, Message: err.Error()})
+			continue
+		}
+		_ = conn.Close()
+		results = append(results, RelayProbeResult{Addr: relay, OK: true, RTT: time.Since(start), Message: "ok"})
+	}
+	return results
+}
+
+func printRelayProbeResults(results []RelayProbeResult) {
+	if len(results) <= 1 {
+		return
+	}
+	for _, result := range results {
+		if result.OK {
+			fmt.Printf("relay %s disponible (%s)\n", result.Addr, result.RTT.Round(time.Millisecond))
+		} else {
+			fmt.Printf("relay %s no disponible (%s)\n", result.Addr, result.Message)
+		}
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func formatBytes(n int64) string {
+	if n >= 1024*1024 {
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
+	if n >= 1024 {
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
 func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 	if ht != nil && msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Host) != "" {
 		ht.set(msg.Host)
@@ -1000,7 +1133,7 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 			ht.set(msg.Host)
 		}
 		t := time.Unix(msg.At, 0).Format("15:04:05")
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s\n", t, colorizeSystem("Nuevo host de la sala: "+strings.TrimSpace(msg.Host)))
 		return
 	}
@@ -1014,7 +1147,7 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 	toLabel := displayNick(msg.To, myNick, hostVal)
 	switch msg.Type {
 	case msgTypeWelcome:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 		if strings.TrimSpace(msg.Assigned) != "" {
 			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Tu nombre:"), msg.Assigned)
@@ -1026,36 +1159,48 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
 		}
 	case msgTypeSystem:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 	case msgTypeError:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s\n", t, colorizeError(msg.Text))
 	case msgTypePeers:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
 	case msgTypeDiag:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s\n", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)
 	case msgTypeChat:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
 	case msgTypePrivate:
 		if myNick != "" && msg.To != myNick && msg.From != myNick {
 			return
 		}
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
 	case msgTypeReaction:
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
 	case msgTypeFile:
 		path, size, err := saveIncomingFile(msg)
-		playConsoleNotification()
+		triggerNotification(msg, myNick)
 		if err != nil {
 			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
 		} else {
 			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
+		}
+	case msgTypeFileChunk:
+		result := saveIncomingFileChunk(msg)
+		if result.Err != nil {
+			fmt.Printf("[%s] %s envio archivo %s (error: %v)\n", t, fromLabel, msg.FileName, result.Err)
+			return
+		}
+		if result.Done {
+			triggerNotification(msg, myNick)
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
+		} else if result.Percent > 0 {
+			fmt.Printf("[%s] recibiendo %s de %s: %d%%\n", t, msg.FileName, fromLabel, result.Percent)
 		}
 	}
 }
@@ -1113,43 +1258,8 @@ func clearConsole() {
 	fmt.Print("\033[2J\033[H")
 }
 
-func playConsoleNotification() {
-	// BEL is terminal-level and works cross-platform when audible bell is enabled.
-	_, _ = fmt.Fprint(os.Stderr, "\a")
-	playNativeNotification()
-}
-
-func playNativeNotification() {
-	notifyMu.Lock()
-	if !lastNotifyAt.IsZero() && time.Since(lastNotifyAt) < 250*time.Millisecond {
-		notifyMu.Unlock()
-		return
-	}
-	lastNotifyAt = time.Now()
-	notifyMu.Unlock()
-
-	switch runtime.GOOS {
-	case "windows":
-		if _, err := exec.LookPath("powershell"); err == nil {
-			_ = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "[console]::beep(1200,120)").Start()
-		}
-	case "darwin":
-		if _, err := exec.LookPath("afplay"); err == nil {
-			_ = exec.Command("afplay", "/System/Library/Sounds/Pop.aiff").Start()
-		}
-	case "linux":
-		if _, err := exec.LookPath("paplay"); err == nil {
-			_ = exec.Command("paplay", "/usr/share/sounds/freedesktop/stereo/message.oga").Start()
-			return
-		}
-		if _, err := exec.LookPath("canberra-gtk-play"); err == nil {
-			_ = exec.Command("canberra-gtk-play", "-i", "message").Start()
-			return
-		}
-		if _, err := exec.LookPath("aplay"); err == nil {
-			_ = exec.Command("aplay", "/usr/share/sounds/alsa/Front_Center.wav").Start()
-		}
-	}
+func triggerNotification(msg wireMessage, myNick string) {
+	notify.Trigger(notify.Event{Type: msg.Type, From: msg.From, To: msg.To, Text: msg.Text, MyNick: myNick})
 }
 
 func printRateLimitLocal() {
@@ -1247,8 +1357,8 @@ func buildFileMessage(path string) (wireMessage, error) {
 	if err != nil {
 		return wireMessage{}, err
 	}
-	if len(raw) > 1_500_000 {
-		return wireMessage{}, fmt.Errorf("archivo excede 1.5MB")
+	if int64(len(raw)) > maxFileBytes {
+		return wireMessage{}, fmt.Errorf("archivo excede limite de %s", formatBytes(maxFileBytes))
 	}
 	name := path
 	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
@@ -1262,27 +1372,174 @@ func buildFileMessage(path string) (wireMessage, error) {
 	}, nil
 }
 
+func sendFileChunks(conn net.Conn, path string) error {
+	chunks, total, checksum, name, err := buildFileChunks(path)
+	if err != nil {
+		return err
+	}
+	for i, msg := range chunks {
+		if err := writeMessage(conn, msg); err != nil {
+			return err
+		}
+		percent := ((i + 1) * 100) / len(chunks)
+		fmt.Printf("enviando %s: %d%%\n", name, percent)
+	}
+	fmt.Printf("archivo enviado: %s (%s, sha256=%s)\n", name, formatBytes(total), checksum)
+	return nil
+}
+
+func buildFileChunks(path string) ([]wireMessage, int64, string, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, "", "", err
+	}
+	total := int64(len(raw))
+	if total > maxFileBytes {
+		return nil, 0, "", "", fmt.Errorf("archivo excede limite de %s", formatBytes(maxFileBytes))
+	}
+	name := path
+	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
+		name = path[idx+1:]
+	}
+	const chunkSize = 64 * 1024
+	sum := sha256.Sum256(raw)
+	checksum := hex.EncodeToString(sum[:])
+	transferID := checksum[:16]
+	chunkCount := int((total + chunkSize - 1) / chunkSize)
+	if chunkCount == 0 {
+		chunkCount = 1
+	}
+	chunks := make([]wireMessage, 0, chunkCount)
+	for i := 0; i < chunkCount; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(raw) {
+			end = len(raw)
+		}
+		payload := ""
+		if start < len(raw) {
+			payload = base64.StdEncoding.EncodeToString(raw[start:end])
+		}
+		chunks = append(chunks, wireMessage{
+			Type:        msgTypeFileChunk,
+			FileName:    name,
+			FilePayload: payload,
+			TransferID:  transferID,
+			ChunkIndex:  i,
+			ChunkCount:  chunkCount,
+			ChunkSize:   chunkSize,
+			TotalSize:   total,
+			Checksum:    checksum,
+			At:          time.Now().Unix(),
+		})
+	}
+	return chunks, total, checksum, name, nil
+}
+
+type fileChunkResult struct {
+	Path    string
+	Size    int
+	Percent int
+	Done    bool
+	Err     error
+}
+
+func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
+	if !validFileChunk(msg) {
+		return fileChunkResult{Err: fmt.Errorf("chunk invalido")}
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.FilePayload)
+	if err != nil {
+		return fileChunkResult{Err: err}
+	}
+	incomingFileMu.Lock()
+	defer incomingFileMu.Unlock()
+
+	tr := incomingFiles[msg.TransferID]
+	if tr == nil {
+		tr = &incomingFileTransfer{
+			name:      msg.FileName,
+			checksum:  msg.Checksum,
+			totalSize: msg.TotalSize,
+			chunks:    make([][]byte, msg.ChunkCount),
+			got:       make([]bool, msg.ChunkCount),
+		}
+		incomingFiles[msg.TransferID] = tr
+	}
+	if msg.ChunkIndex >= len(tr.chunks) {
+		return fileChunkResult{Err: fmt.Errorf("chunk fuera de rango")}
+	}
+	if !tr.got[msg.ChunkIndex] {
+		tr.got[msg.ChunkIndex] = true
+		tr.chunks[msg.ChunkIndex] = raw
+		tr.received++
+	}
+	percent := (tr.received * 100) / len(tr.chunks)
+	if tr.received < len(tr.chunks) {
+		if percent >= tr.lastPercent+10 || percent == 100 {
+			tr.lastPercent = percent
+			return fileChunkResult{Percent: percent}
+		}
+		return fileChunkResult{}
+	}
+
+	assembled := make([]byte, 0, tr.totalSize)
+	for _, chunk := range tr.chunks {
+		assembled = append(assembled, chunk...)
+	}
+	if int64(len(assembled)) != tr.totalSize {
+		return fileChunkResult{Err: fmt.Errorf("tamano recibido invalido")}
+	}
+	sum := sha256.Sum256(assembled)
+	if hex.EncodeToString(sum[:]) != tr.checksum {
+		return fileChunkResult{Err: fmt.Errorf("checksum invalido")}
+	}
+	path, err := writeIncomingFile(tr.name, assembled)
+	if err != nil {
+		return fileChunkResult{Err: err}
+	}
+	delete(incomingFiles, msg.TransferID)
+	return fileChunkResult{Path: path, Size: len(assembled), Percent: 100, Done: true}
+}
+
+func validFileChunk(msg wireMessage) bool {
+	return strings.TrimSpace(msg.TransferID) != "" &&
+		strings.TrimSpace(msg.FileName) != "" &&
+		msg.ChunkCount > 0 &&
+		msg.ChunkIndex >= 0 &&
+		msg.ChunkIndex < msg.ChunkCount &&
+		msg.TotalSize >= 0 &&
+		msg.TotalSize <= maxFileBytes &&
+		strings.TrimSpace(msg.Checksum) != "" &&
+		int64(len(msg.FilePayload)) <= maxFileBytes*2
+}
+
 func saveIncomingFile(msg wireMessage) (string, int, error) {
 	raw, err := base64.StdEncoding.DecodeString(msg.FilePayload)
 	if err != nil {
 		return "", 0, err
 	}
-	if len(raw) > 1_500_000 {
+	if int64(len(raw)) > maxFileBytes {
 		return "", 0, fmt.Errorf("archivo recibido excede limite")
 	}
-	name := sanitizeFileName(msg.FileName)
-	if name == "" {
-		name = "archivo.bin"
+	path, err := writeIncomingFile(msg.FileName, raw)
+	return path, len(raw), err
+}
+
+func writeIncomingFile(name string, raw []byte) (string, error) {
+	safeName := sanitizeFileName(name)
+	if safeName == "" {
+		safeName = "archivo.bin"
 	}
 	dir, err := downloadDir()
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
-	filePath := filepath.Join(dir, fmt.Sprintf("brinco-%d-%s", time.Now().Unix(), name))
+	filePath := filepath.Join(dir, fmt.Sprintf("brinco-%d-%s", time.Now().Unix(), safeName))
 	if err := os.WriteFile(filePath, raw, 0o600); err != nil {
-		return "", 0, err
+		return "", err
 	}
-	return filePath, len(raw), nil
+	return filePath, nil
 }
 
 func downloadDir() (string, error) {

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"brinco-cli/internal/logx"
+	"brinco-cli/internal/notify"
+	"brinco-cli/internal/roomcode"
 	"brinco-cli/internal/roomproto"
 
 	"github.com/libp2p/go-libp2p"
@@ -50,6 +53,12 @@ type chatMessage struct {
 	To          string `json:"to,omitempty"`
 	FileName    string `json:"fileName,omitempty"`
 	FilePayload string `json:"filePayload,omitempty"`
+	TransferID  string `json:"transferId,omitempty"`
+	ChunkIndex  int    `json:"chunkIndex,omitempty"`
+	ChunkCount  int    `json:"chunkCount,omitempty"`
+	ChunkSize   int    `json:"chunkSize,omitempty"`
+	TotalSize   int64  `json:"totalSize,omitempty"`
+	Checksum    string `json:"checksum,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
@@ -64,9 +73,10 @@ type encryptedMessage struct {
 var errNotEncryptedEnvelope = errors.New("payload no es sobre cifrado brinco")
 
 type roomCodePayload struct {
-	Topic string   `json:"topic"`
-	Relay string   `json:"relay,omitempty"`
-	Peers []string `json:"peers,omitempty"`
+	Topic  string   `msgpack:"t"`
+	Relay  string   `msgpack:"r,omitempty"`
+	Relays []string `msgpack:"y,omitempty"`
+	Peers  []string `msgpack:"p,omitempty"`
 }
 
 // Node es el nodo libp2p del usuario
@@ -105,7 +115,26 @@ var (
 	nickColorMuP2P      sync.Mutex
 	nickColorByNameP2P  = map[string]string{}
 	nextNickColorIdxP2P int
+	maxP2PFileBytes     int64 = 10 * 1024 * 1024
+	incomingP2PFileMu         sync.Mutex
+	incomingP2PFiles          = map[string]*incomingP2PFileTransfer{}
 )
+
+type incomingP2PFileTransfer struct {
+	name        string
+	checksum    string
+	totalSize   int64
+	chunks      [][]byte
+	got         []bool
+	received    int
+	lastPercent int
+}
+
+func SetMaxFileBytes(limit int64) {
+	if limit > 0 {
+		maxP2PFileBytes = limit
+	}
+}
 
 // NewNodeGuaranteed crea un nodo libp2p que usa el DHT de la red IPFS para
 // descubrir relays circuit v2 automaticamente. Fuerza reachability privada para
@@ -275,19 +304,39 @@ func (n *Node) Bootstrap(customRelays []string) {
 // o hasta que expire el timeout. Devuelve true si se encontro relay.
 func (n *Node) WaitForRelay(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
+	start := time.Now()
 	for time.Now().Before(deadline) {
 		for _, addr := range n.host.Addrs() {
 			if strings.Contains(addr.String(), "p2p-circuit") {
 				return true
 			}
 		}
+		wait := relayWaitPollInterval(time.Since(start))
+		if rem := time.Until(deadline); rem <= 0 {
+			return false
+		} else if wait > rem {
+			wait = rem
+		}
 		select {
 		case <-n.ctx.Done():
 			return false
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(wait):
 		}
 	}
 	return false
+}
+
+// relayWaitPollInterval usa sondeo mas frecuente al principio (el relay suele
+// aparecer en los primeros segundos) y mas espaciado despues para no gastar CPU.
+func relayWaitPollInterval(elapsed time.Duration) time.Duration {
+	switch {
+	case elapsed < 5*time.Second:
+		return 100 * time.Millisecond
+	case elapsed < 15*time.Second:
+		return 200 * time.Millisecond
+	default:
+		return 400 * time.Millisecond
+	}
 }
 
 // JoinTopic suscribe al topic de la sala
@@ -366,12 +415,13 @@ func BuildRoomCode(topic, relayAddr string, peers []string) (string, error) {
 
 // BuildRoomCodeWithProtocol genera un codigo de sala con el prefijo de protocolo indicado.
 func BuildRoomCodeWithProtocol(topic, relayAddr string, peers []string, protocol string) (string, error) {
-	payload := roomCodePayload{Topic: topic, Relay: relayAddr, Peers: peers}
-	raw, err := json.Marshal(payload)
+	relays := splitRelayList(relayAddr)
+	payload := roomCodePayload{Topic: topic, Relays: relays, Peers: peers}
+	encoded, err := roomcode.Encode(payload)
 	if err != nil {
 		return "", err
 	}
-	return roomproto.Wrap(protocol, base64.RawURLEncoding.EncodeToString(raw)), nil
+	return roomproto.Wrap(protocol, encoded), nil
 }
 
 func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
@@ -382,12 +432,8 @@ func ParseRoomCodeDetailed(code string) (roomCodePayload, error) {
 	if encoded == "" {
 		encoded = strings.TrimSpace(code)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return roomCodePayload{}, err
-	}
 	var rc roomCodePayload
-	if err := json.Unmarshal(raw, &rc); err != nil {
+	if err := roomcode.Decode(encoded, &rc); err != nil {
 		return roomCodePayload{}, err
 	}
 	if rc.Topic == "" {
@@ -402,7 +448,15 @@ func ParseRoomCode(code string) (topic string, relayAddr string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	return payload.Topic, payload.Relay, nil
+	return payload.Topic, firstString(payload.relayCandidates()), nil
+}
+
+func (p roomCodePayload) relayCandidates() []string {
+	out := append([]string{}, p.Relays...)
+	if strings.TrimSpace(p.Relay) != "" {
+		out = append([]string{p.Relay}, out...)
+	}
+	return uniqueStrings(out)
 }
 
 // AdvertisePeerAddrs devuelve multiaddrs p2p del nodo para que otros peers puedan conectar.
@@ -751,21 +805,42 @@ func renderMessage(msg chatMessage, myNick string) {
 	toLabel := displayNickP2P(msg.To, myNick)
 	switch msg.Type {
 	case "system":
+		triggerP2PNotification(msg, myNick)
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 	case "chat":
+		triggerP2PNotification(msg, myNick)
 		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
 	case "private":
+		triggerP2PNotification(msg, myNick)
 		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
 	case "reaction":
+		triggerP2PNotification(msg, myNick)
 		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
 	case "file":
 		path, size, err := saveIncomingP2PFile(msg)
+		triggerP2PNotification(msg, myNick)
 		if err != nil {
 			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
 		} else {
 			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
 		}
+	case "file_chunk":
+		result := saveIncomingP2PFileChunk(msg)
+		if result.Err != nil {
+			fmt.Printf("[%s] %s envio archivo %s (error: %v)\n", t, fromLabel, msg.FileName, result.Err)
+			return
+		}
+		if result.Done {
+			triggerP2PNotification(msg, myNick)
+			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
+		} else if result.Percent > 0 {
+			fmt.Printf("[%s] recibiendo %s de %s: %d%%\n", t, msg.FileName, fromLabel, result.Percent)
+		}
 	}
+}
+
+func triggerP2PNotification(msg chatMessage, myNick string) {
+	notify.Trigger(notify.Event{Type: msg.Type, From: msg.From, To: msg.To, Text: msg.Text, MyNick: myNick})
 }
 
 func displayNickP2P(nick, myNick string) string {
@@ -983,27 +1058,54 @@ func (n *Node) sendFile(path string) error {
 	if err != nil {
 		return err
 	}
-	if len(raw) > 1_500_000 {
-		return fmt.Errorf("archivo excede 1.5MB")
+	if int64(len(raw)) > maxP2PFileBytes {
+		return fmt.Errorf("archivo excede limite de %s", formatBytes(maxP2PFileBytes))
 	}
 	name := path
 	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
 		name = path[idx+1:]
 	}
-	msg := chatMessage{
-		ID:          newMessageID(),
-		From:        n.name,
-		Type:        "file",
-		At:          time.Now().Unix(),
-		FileName:    name,
-		FilePayload: base64.StdEncoding.EncodeToString(raw),
-		Fingerprint: n.fingerprint(),
+	const chunkSize = 64 * 1024
+	sum := sha256.Sum256(raw)
+	checksum := hex.EncodeToString(sum[:])
+	transferID := checksum[:16]
+	chunkCount := int((int64(len(raw)) + chunkSize - 1) / chunkSize)
+	if chunkCount == 0 {
+		chunkCount = 1
 	}
-	if err := n.publishMessage(msg); err != nil {
-		return err
+	for i := 0; i < chunkCount; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(raw) {
+			end = len(raw)
+		}
+		payload := ""
+		if start < len(raw) {
+			payload = base64.StdEncoding.EncodeToString(raw[start:end])
+		}
+		msg := chatMessage{
+			ID:          newMessageID(),
+			From:        n.name,
+			Type:        "file_chunk",
+			At:          time.Now().Unix(),
+			FileName:    name,
+			FilePayload: payload,
+			TransferID:  transferID,
+			ChunkIndex:  i,
+			ChunkCount:  chunkCount,
+			ChunkSize:   chunkSize,
+			TotalSize:   int64(len(raw)),
+			Checksum:    checksum,
+			Fingerprint: n.fingerprint(),
+		}
+		if err := n.publishMessage(msg); err != nil {
+			return err
+		}
+		percent := ((i + 1) * 100) / chunkCount
+		fmt.Printf("enviando %s: %d%%\n", name, percent)
 	}
-	t := time.Unix(msg.At, 0).Format("15:04:05")
-	fmt.Printf("[%s] %s envio archivo %s (%d bytes)\n", t, displayNickP2P(msg.From, n.name), msg.FileName, len(raw))
+	t := time.Now().Format("15:04:05")
+	fmt.Printf("[%s] %s envio archivo %s (%s, sha256=%s)\n", t, displayNickP2P(n.name, n.name), name, formatBytes(int64(len(raw))), checksum)
 	return nil
 }
 
@@ -1012,22 +1114,104 @@ func saveIncomingP2PFile(msg chatMessage) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	if len(raw) > 1_500_000 {
+	if int64(len(raw)) > maxP2PFileBytes {
 		return "", 0, fmt.Errorf("archivo recibido excede limite")
 	}
-	name := sanitizeP2PFileName(msg.FileName)
+	path, err := writeIncomingP2PFile(msg.FileName, raw)
+	return path, len(raw), err
+}
+
+type p2pFileChunkResult struct {
+	Path    string
+	Size    int
+	Percent int
+	Done    bool
+	Err     error
+}
+
+func saveIncomingP2PFileChunk(msg chatMessage) p2pFileChunkResult {
+	if !validP2PFileChunk(msg) {
+		return p2pFileChunkResult{Err: fmt.Errorf("chunk invalido")}
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.FilePayload)
+	if err != nil {
+		return p2pFileChunkResult{Err: err}
+	}
+	incomingP2PFileMu.Lock()
+	defer incomingP2PFileMu.Unlock()
+
+	tr := incomingP2PFiles[msg.TransferID]
+	if tr == nil {
+		tr = &incomingP2PFileTransfer{
+			name:      msg.FileName,
+			checksum:  msg.Checksum,
+			totalSize: msg.TotalSize,
+			chunks:    make([][]byte, msg.ChunkCount),
+			got:       make([]bool, msg.ChunkCount),
+		}
+		incomingP2PFiles[msg.TransferID] = tr
+	}
+	if msg.ChunkIndex >= len(tr.chunks) {
+		return p2pFileChunkResult{Err: fmt.Errorf("chunk fuera de rango")}
+	}
+	if !tr.got[msg.ChunkIndex] {
+		tr.got[msg.ChunkIndex] = true
+		tr.chunks[msg.ChunkIndex] = raw
+		tr.received++
+	}
+	percent := (tr.received * 100) / len(tr.chunks)
+	if tr.received < len(tr.chunks) {
+		if percent >= tr.lastPercent+10 || percent == 100 {
+			tr.lastPercent = percent
+			return p2pFileChunkResult{Percent: percent}
+		}
+		return p2pFileChunkResult{}
+	}
+	assembled := make([]byte, 0, tr.totalSize)
+	for _, chunk := range tr.chunks {
+		assembled = append(assembled, chunk...)
+	}
+	if int64(len(assembled)) != tr.totalSize {
+		return p2pFileChunkResult{Err: fmt.Errorf("tamano recibido invalido")}
+	}
+	sum := sha256.Sum256(assembled)
+	if hex.EncodeToString(sum[:]) != tr.checksum {
+		return p2pFileChunkResult{Err: fmt.Errorf("checksum invalido")}
+	}
+	path, err := writeIncomingP2PFile(tr.name, assembled)
+	if err != nil {
+		return p2pFileChunkResult{Err: err}
+	}
+	delete(incomingP2PFiles, msg.TransferID)
+	return p2pFileChunkResult{Path: path, Size: len(assembled), Percent: 100, Done: true}
+}
+
+func validP2PFileChunk(msg chatMessage) bool {
+	return strings.TrimSpace(msg.TransferID) != "" &&
+		strings.TrimSpace(msg.FileName) != "" &&
+		msg.ChunkCount > 0 &&
+		msg.ChunkIndex >= 0 &&
+		msg.ChunkIndex < msg.ChunkCount &&
+		msg.TotalSize >= 0 &&
+		msg.TotalSize <= maxP2PFileBytes &&
+		strings.TrimSpace(msg.Checksum) != "" &&
+		int64(len(msg.FilePayload)) <= maxP2PFileBytes*2
+}
+
+func writeIncomingP2PFile(fileName string, raw []byte) (string, error) {
+	name := sanitizeP2PFileName(fileName)
 	if name == "" {
 		name = "archivo.bin"
 	}
 	dir, err := p2pDownloadDir()
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
 	path := filepath.Join(dir, fmt.Sprintf("brinco-%d-%s", time.Now().Unix(), name))
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", 0, err
+		return "", err
 	}
-	return path, len(raw), nil
+	return path, nil
 }
 
 func p2pDownloadDir() (string, error) {
@@ -1114,6 +1298,98 @@ func peerInfosFromAddrs(addrs []string) []peer.AddrInfo {
 		pis = append(pis, *pi)
 	}
 	return pis
+}
+
+func splitRelayList(value string) []string {
+	return uniqueStrings(strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';'
+	}))
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func selectBestP2PRelay(relays []string, timeout time.Duration) string {
+	relays = uniqueStrings(relays)
+	if len(relays) == 0 {
+		return ""
+	}
+	best := ""
+	var bestRTT time.Duration
+	for _, relay := range relays {
+		tcpAddr, ok := multiaddrTCPAddr(relay)
+		if !ok {
+			continue
+		}
+		start := time.Now()
+		conn, err := netDialTimeout("tcp", tcpAddr, timeout)
+		if err != nil {
+			fmt.Printf("relay %s no disponible (%v)\n", relay, err)
+			continue
+		}
+		_ = conn.Close()
+		rtt := time.Since(start)
+		fmt.Printf("relay %s disponible (%s)\n", relay, rtt.Round(time.Millisecond))
+		if best == "" || rtt < bestRTT {
+			best = relay
+			bestRTT = rtt
+		}
+	}
+	if best == "" {
+		return relays[0]
+	}
+	return best
+}
+
+var netDialTimeout = func(network, address string, timeout time.Duration) (interface{ Close() error }, error) {
+	return (&net.Dialer{Timeout: timeout}).Dial(network, address)
+}
+
+func multiaddrTCPAddr(value string) (string, bool) {
+	ma, err := multiaddr.NewMultiaddr(strings.TrimSpace(value))
+	if err != nil {
+		return "", false
+	}
+	host, err := ma.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		host, err = ma.ValueForProtocol(multiaddr.P_DNS4)
+	}
+	if err != nil {
+		host, err = ma.ValueForProtocol(multiaddr.P_DNS)
+	}
+	port, err := ma.ValueForProtocol(multiaddr.P_TCP)
+	if err != nil || host == "" || port == "" {
+		return "", false
+	}
+	return host + ":" + port, true
+}
+
+func formatBytes(n int64) string {
+	if n >= 1024*1024 {
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
+	if n >= 1024 {
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 // EnableRelayCircuit activa circuit relay v2 usando un relay propio

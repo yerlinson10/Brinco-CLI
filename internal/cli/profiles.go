@@ -18,6 +18,9 @@ type Profile struct {
 	Listen   string `json:"listen,omitempty"`
 	Public   string `json:"public,omitempty"`
 	Name     string `json:"name,omitempty"`
+	NotifySound string `json:"notifySound,omitempty"`
+	NotifyLevel string `json:"notifyLevel,omitempty"`
+	FileLimit   string `json:"fileLimit,omitempty"`
 }
 
 func profilesDir() (string, error) {

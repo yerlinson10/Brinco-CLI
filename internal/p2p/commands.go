@@ -21,10 +21,7 @@ func RunCreate(name, relayAddr string) int {
 
 	fmt.Println("Iniciando nodo P2P...")
 
-	var relayAddrs []string
-	if strings.TrimSpace(relayAddr) != "" {
-		relayAddrs = append(relayAddrs, relayAddr)
-	}
+	relayAddrs := splitRelayList(relayAddr)
 
 	ctx := context.Background()
 	node, err := NewNode(ctx, relayAddrs)
@@ -39,11 +36,11 @@ func RunCreate(name, relayAddr string) int {
 	fmt.Println("Conectando a la red P2P...")
 	node.Bootstrap(relayAddrs)
 
-	if strings.TrimSpace(relayAddr) != "" {
-		if err := node.EnableRelayCircuit(relayAddr); err != nil {
+	if bestRelay := selectBestP2PRelay(relayAddrs, 900*time.Millisecond); bestRelay != "" {
+		if err := node.EnableRelayCircuit(bestRelay); err != nil {
 			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo reservar circuito relay: %v\n", err)
 		} else {
-			fmt.Println("Relay propio activado")
+			fmt.Printf("Relay propio activado: %s\n", bestRelay)
 		}
 	}
 
@@ -58,7 +55,7 @@ func RunCreate(name, relayAddr string) int {
 		return 1
 	}
 
-	code, err := BuildRoomCode(topic, relayAddr, node.AdvertisePeerAddrs())
+	code, err := BuildRoomCode(topic, strings.Join(relayAddrs, ","), node.AdvertisePeerAddrs())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error generando codigo: %v\n", err)
 		return 1
@@ -96,18 +93,14 @@ func RunJoin(name, code, relayAddr string) int {
 	}
 
 	topic := payload.Topic
-	codeRelay := payload.Relay
+	codeRelays := payload.relayCandidates()
 
 	// El relay del codigo tiene prioridad; si el usuario tambien paso --relay, lo agrega
-	effectiveRelay := codeRelay
-	if strings.TrimSpace(relayAddr) != "" {
-		effectiveRelay = relayAddr
+	relayAddrs := codeRelays
+	if cliRelays := splitRelayList(relayAddr); len(cliRelays) > 0 {
+		relayAddrs = append(cliRelays, relayAddrs...)
 	}
-
-	var relayAddrs []string
-	if strings.TrimSpace(effectiveRelay) != "" {
-		relayAddrs = append(relayAddrs, effectiveRelay)
-	}
+	relayAddrs = uniqueStrings(relayAddrs)
 
 	fmt.Println("Iniciando nodo P2P...")
 	ctx := context.Background()
@@ -123,11 +116,11 @@ func RunJoin(name, code, relayAddr string) int {
 	fmt.Println("Conectando a la red P2P...")
 	node.Bootstrap(relayAddrs)
 
-	if strings.TrimSpace(effectiveRelay) != "" {
-		if err := node.EnableRelayCircuit(effectiveRelay); err != nil {
+	if bestRelay := selectBestP2PRelay(relayAddrs, 900*time.Millisecond); bestRelay != "" {
+		if err := node.EnableRelayCircuit(bestRelay); err != nil {
 			fmt.Fprintf(os.Stderr, "Advertencia: relay no disponible: %v\n", err)
 		} else {
-			fmt.Println("Relay propio activado")
+			fmt.Printf("Relay propio activado: %s\n", bestRelay)
 		}
 	}
 

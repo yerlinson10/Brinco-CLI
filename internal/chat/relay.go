@@ -49,9 +49,15 @@ func RunCreateUsingRelayWithProtocol(name, relayAddr, password, protocol string)
 	if !roomproto.IsKnown(protocol) {
 		protocol = roomproto.ProtocolRelay
 	}
-	logx.Info("relay create start", "relay", relayAddr, "protocol", protocol)
-	fmt.Printf("Conectando al relay %s...\n", relayAddr)
-	return runRelayClient(relayAddr, "", name, password, "", true, protocol)
+	relays := SplitRelayList(relayAddr)
+	best, results := SelectBestTCPRelay(relays, 900*time.Millisecond)
+	printRelayProbeResults(results)
+	if best == "" {
+		best = relayAddr
+	}
+	logx.Info("relay create start", "relay", best, "protocol", protocol)
+	fmt.Printf("Conectando al relay %s...\n", best)
+	return runRelayClient(best, "", name, password, "", true, protocol)
 }
 
 func RunRelayServer(listenAddr, publicAddr string) int {
@@ -212,8 +218,14 @@ func (h *relayHub) handleConn(conn net.Conn) {
 				room.broadcast(wireMessage{Type: msgTypeReaction, From: client.name, Text: msg.Text, At: time.Now().Unix()}, nil)
 			}
 		case msgTypeFile:
-			if strings.TrimSpace(msg.FileName) != "" && len(msg.FilePayload) <= 2_200_000 {
+			if strings.TrimSpace(msg.FileName) != "" && int64(len(msg.FilePayload)) <= maxFileBytes*2 {
 				room.broadcast(wireMessage{Type: msgTypeFile, From: client.name, FileName: msg.FileName, FilePayload: msg.FilePayload, At: time.Now().Unix()}, nil)
+			}
+		case msgTypeFileChunk:
+			if validFileChunk(msg) {
+				msg.From = client.name
+				msg.At = time.Now().Unix()
+				room.broadcast(msg, nil)
 			}
 		case msgTypeQuit:
 			goto cleanup
@@ -637,15 +649,12 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 					}
 					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
 				} else if strings.HasPrefix(line, "/send ") {
-					msg, err := buildFileMessage(strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
-					if err != nil {
+					if !localLimiter.allow() {
+						printRateLimitLocal()
+						continue
+					}
+					if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
 						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
-					} else {
-						if !localLimiter.allow() {
-							printRateLimitLocal()
-							continue
-						}
-						_ = writeMessage(conn, msg)
 					}
 				} else {
 					fmt.Println("Comando no reconocido. Usa /help")
