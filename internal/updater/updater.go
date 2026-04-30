@@ -215,17 +215,33 @@ func Apply(currentVersion string) error {
 			if err := scheduleWindowsSelfReplace(exe, dst); err != nil {
 				return err
 			}
-			fmt.Println("Actualizacion lista: al cerrar esta instancia de Brinco se reemplazara el .exe automaticamente.")
+			fmt.Println(deferredInstallMessage())
 			return nil
 		}
 		fmt.Printf("Actualizacion descargada en %s. Cierra Brinco y reemplaza el binario manualmente.\n", dst)
 		return nil
 	}
 	if err := atomicReplaceBinary(newBin, exe); err != nil {
+		if isExecReplaceBusy(err) {
+			dst := exe + ".new"
+			if err := copyFileWithMode(newBin, dst, 0o755); err != nil {
+				return fmt.Errorf("copia temporal para actualizacion aplazada: %w", err)
+			}
+			if err := scheduleDeferredPOSIXReplace(exe, dst); err != nil {
+				_ = os.Remove(dst)
+				return fmt.Errorf("programar actualizacion aplazada: %w", err)
+			}
+			fmt.Println(deferredInstallMessage())
+			return nil
+		}
 		return err
 	}
 	fmt.Printf("Actualizado a %s correctamente.\n", latest)
 	return nil
+}
+
+func deferredInstallMessage() string {
+	return "Actualizacion lista: al cerrar esta instancia de Brinco se aplicara el binario automaticamente."
 }
 
 func prereleaseFromEnv() bool {

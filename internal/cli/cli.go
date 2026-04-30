@@ -108,6 +108,7 @@ const updateHelpText = `brinco update — GitHub Releases (yerlinson10/Brinco-CL
     BRINCO_UPDATE_MINISIGN_PUBKEY=RWT3gbCcNzwhERPbMCrksoJYot+hxt8y1Xz2C76I6vFweMl/puY6Wz7z
     BRINCO_UPDATE_PROGRESS=1      muestra progreso de descarga en la consola
     BRINCO_UPDATE_WINDOWS_DEFERRED=0  en Windows no programa reemplazo al salir (solo deja .exe.new)
+    Linux/macOS: primero reemplazo atómico; si el binario está en uso, se programa el mismo reemplazo al salir que en Windows.
 `
 
 func Run(args []string) int {
