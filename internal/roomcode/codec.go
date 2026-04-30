@@ -2,7 +2,9 @@ package roomcode
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -10,6 +12,7 @@ import (
 )
 
 const zstdLevel = 22
+const maxCompressedPayloadBytes = 64 * 1024 // 64 KiB
 
 var (
 	encoderOnce sync.Once
@@ -19,6 +22,10 @@ var (
 	decoderOnce sync.Once
 	decoder     *zstd.Decoder
 	decoderErr  error
+
+	errEmptyPayload  = errors.New("payload is empty")
+	errNilOutput     = errors.New("output target is nil")
+	errInvalidOutput = errors.New("output target must be a non-nil pointer")
 )
 
 func encodeZstd(v any) (string, error) {
@@ -30,13 +37,20 @@ func encodeZstd(v any) (string, error) {
 	}
 	raw, err := msgpack.Marshal(v)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("marshal msgpack payload: %w", err)
 	}
 	compressed := encoder.EncodeAll(raw, nil)
 	return base64.RawURLEncoding.EncodeToString(compressed), nil
 }
 
 func decodeZstd(payload string, out any) error {
+	if payload == "" {
+		return errEmptyPayload
+	}
+	if err := validateDecodeOutput(out); err != nil {
+		return err
+	}
+
 	decoderOnce.Do(func() {
 		decoder, decoderErr = zstd.NewReader(nil)
 	})
@@ -45,13 +59,19 @@ func decodeZstd(payload string, out any) error {
 	}
 	compressed, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("decode base64 payload: %w", err)
+	}
+	if len(compressed) > maxCompressedPayloadBytes {
+		return fmt.Errorf("compressed payload too large: %d bytes (max %d)", len(compressed), maxCompressedPayloadBytes)
 	}
 	raw, err := decoder.DecodeAll(compressed, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("decompress zstd payload: %w", err)
 	}
-	return msgpack.Unmarshal(raw, out)
+	if err := msgpack.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("unmarshal msgpack payload: %w", err)
+	}
+	return nil
 }
 
 func Encode(v any) (string, error) {
@@ -60,4 +80,15 @@ func Encode(v any) (string, error) {
 
 func Decode(payload string, out any) error {
 	return decodeZstd(payload, out)
+}
+
+func validateDecodeOutput(out any) error {
+	if out == nil {
+		return errNilOutput
+	}
+	target := reflect.ValueOf(out)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return errInvalidOutput
+	}
+	return nil
 }
