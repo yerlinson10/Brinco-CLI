@@ -3,6 +3,7 @@ module brinco-cli
 go 1.25.7
 
 require (
+	aead.dev/minisign v0.3.0
 	github.com/klauspost/compress v1.18.1
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-kad-dht v0.39.1

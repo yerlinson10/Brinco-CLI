@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"aead.dev/minisign"
 	"golang.org/x/mod/semver"
 )
 
@@ -33,9 +34,14 @@ const (
 
 	maxReleaseAssetBytes = 256 << 20 // 256 MiB
 	maxChecksumFileBytes = 1 << 20   // 1 MiB
+	maxSignatureFileBytes = 64 << 10 // 64 KiB
 
 	maxHTTPRetries = 4
 	initialBackoff = 300 * time.Millisecond
+
+	// Puedes fijar la clave pública aquí para pinning fuerte.
+	// Formato esperado: RWQ...
+	trustedMinisignPublicKey = ""
 )
 
 var defaultHTTPClient = &http.Client{
@@ -110,21 +116,33 @@ func Apply(currentVersion string) error {
 	if runtime.GOOS == "windows" {
 		wantedExt = ".zip"
 	}
-	var assetURL, checksumsURL string
+	var assetURL, assetFileName, checksumsURL, checksumsSigURL string
 	for _, a := range rel.Assets {
 		if strings.HasPrefix(a.Name, archiveName) && strings.HasSuffix(a.Name, wantedExt) {
 			assetURL = a.URL
+			assetFileName = a.Name
 		}
 		if a.Name == "checksums.txt" {
 			checksumsURL = a.URL
 		}
+		if a.Name == "checksums.txt.minisig" {
+			checksumsSigURL = a.URL
+		}
 	}
-	if assetURL == "" {
+	if assetURL == "" || assetFileName == "" {
 		return fmt.Errorf("no se encontro artefacto para %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
 	if envRequireChecksum() && checksumsURL == "" {
 		return fmt.Errorf("BRINCO_UPDATE_REQUIRE_CHECKSUM activo pero el release no incluye checksums.txt")
+	}
+	if envRequireSignature() {
+		if checksumsURL == "" {
+			return fmt.Errorf("BRINCO_UPDATE_REQUIRE_SIGNATURE activo pero no existe checksums.txt")
+		}
+		if checksumsSigURL == "" {
+			return fmt.Errorf("BRINCO_UPDATE_REQUIRE_SIGNATURE activo pero no existe checksums.txt.minisig")
+		}
 	}
 
 	tmpDir, err := os.MkdirTemp("", "brinco-update-*")
@@ -133,7 +151,8 @@ func Apply(currentVersion string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	archivePath := filepath.Join(tmpDir, "release"+wantedExt)
+	// Mismo nombre que en el release y en checksums.txt (p. ej. brinco_1.2.3_windows_amd64.zip).
+	archivePath := filepath.Join(tmpDir, filepath.Base(assetFileName))
 	if err := download(ctx, assetURL, archivePath, maxReleaseAssetBytes, progressWriter()); err != nil {
 		return fmt.Errorf("descarga del release: %w", err)
 	}
@@ -142,6 +161,17 @@ func Apply(currentVersion string) error {
 		sumPath := filepath.Join(tmpDir, "checksums.txt")
 		if err := download(ctx, checksumsURL, sumPath, maxChecksumFileBytes, nil); err != nil {
 			return fmt.Errorf("descarga checksums.txt: %w", err)
+		}
+		if checksumsSigURL != "" {
+			sigPath := filepath.Join(tmpDir, "checksums.txt.minisig")
+			if err := download(ctx, checksumsSigURL, sigPath, maxSignatureFileBytes, nil); err != nil {
+				return fmt.Errorf("descarga checksums.txt.minisig: %w", err)
+			}
+			if err := verifyMinisign(sumPath, sigPath); err != nil {
+				return err
+			}
+		} else if envRequireSignature() {
+			return fmt.Errorf("falta checksums.txt.minisig en el release")
 		}
 		if err := verifyChecksum(archivePath, sumPath); err != nil {
 			return err
@@ -181,7 +211,14 @@ func Apply(currentVersion string) error {
 		if err := copyFileWithMode(newBin, dst, 0o755); err != nil {
 			return fmt.Errorf("copia a %s: %w", dst, err)
 		}
-		fmt.Printf("Actualizacion descargada en %s. Cierra Brinco y reemplaza el binario.\n", dst)
+		if envWindowsDeferredReplace() {
+			if err := scheduleWindowsSelfReplace(exe, dst); err != nil {
+				return err
+			}
+			fmt.Println("Actualizacion lista: al cerrar esta instancia de Brinco se reemplazara el .exe automaticamente.")
+			return nil
+		}
+		fmt.Printf("Actualizacion descargada en %s. Cierra Brinco y reemplaza el binario manualmente.\n", dst)
 		return nil
 	}
 	if err := atomicReplaceBinary(newBin, exe); err != nil {
@@ -208,6 +245,35 @@ func envRequireChecksum() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func envRequireSignature() bool {
+	v := strings.TrimSpace(os.Getenv("BRINCO_UPDATE_REQUIRE_SIGNATURE"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return strings.TrimSpace(trustedMinisignPublicKey) != ""
+	}
+}
+
+func trustedPublicKeyText() string {
+	if env := strings.TrimSpace(os.Getenv("BRINCO_UPDATE_MINISIGN_PUBKEY")); env != "" {
+		return env
+	}
+	return strings.TrimSpace(trustedMinisignPublicKey)
+}
+
+func envWindowsDeferredReplace() bool {
+	v := strings.TrimSpace(os.Getenv("BRINCO_UPDATE_WINDOWS_DEFERRED"))
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -492,6 +558,29 @@ func verifyChecksum(archivePath, checksumsPath string) error {
 		return fmt.Errorf("checksum inválido para %s (esperado en manifest distinto del calculado)", fileName)
 	}
 	return fmt.Errorf("checksums.txt no contiene entrada para %s", fileName)
+}
+
+func verifyMinisign(messagePath, sigPath string) error {
+	pubText := trustedPublicKeyText()
+	if pubText == "" {
+		return fmt.Errorf("no hay clave pública minisign configurada (usa BRINCO_UPDATE_MINISIGN_PUBKEY o trustedMinisignPublicKey)")
+	}
+	var pub minisign.PublicKey
+	if err := pub.UnmarshalText([]byte(pubText)); err != nil {
+		return fmt.Errorf("clave pública minisign inválida: %w", err)
+	}
+	message, err := os.ReadFile(messagePath)
+	if err != nil {
+		return fmt.Errorf("leer mensaje firmado: %w", err)
+	}
+	signature, err := os.ReadFile(sigPath)
+	if err != nil {
+		return fmt.Errorf("leer firma minisign: %w", err)
+	}
+	if !minisign.Verify(pub, message, signature) {
+		return fmt.Errorf("firma minisign inválida para %s", filepath.Base(messagePath))
+	}
+	return nil
 }
 
 func extractZipBinary(archivePath, dst string) error {

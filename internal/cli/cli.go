@@ -104,7 +104,10 @@ const updateHelpText = `brinco update — GitHub Releases (yerlinson10/Brinco-CL
     BRINCO_UPDATE_PRERELEASE=1     usar el release con tag semver más alto (incluye pre-releases)
     BRINCO_UPDATE_RELEASE_API=URL JSON de un solo release (sobrescribe la API por defecto)
     BRINCO_UPDATE_REQUIRE_CHECKSUM=1  falla si no hay checksums.txt o no coincide
+    BRINCO_UPDATE_REQUIRE_SIGNATURE=1 valida firma minisign de checksums.txt
+    BRINCO_UPDATE_MINISIGN_PUBKEY=RWT3gbCcNzwhERPbMCrksoJYot+hxt8y1Xz2C76I6vFweMl/puY6Wz7z
     BRINCO_UPDATE_PROGRESS=1      muestra progreso de descarga en la consola
+    BRINCO_UPDATE_WINDOWS_DEFERRED=0  en Windows no programa reemplazo al salir (solo deja .exe.new)
 `
 
 func Run(args []string) int {

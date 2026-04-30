@@ -36,6 +36,22 @@ archives:
 checksum:
   name_template: checksums.txt
 
+signs:
+  - id: checksums_minisign
+    artifacts: checksum
+    cmd: minisign
+    signature: "${artifact}.minisig"
+    args:
+      - -S
+      - -s
+      - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
+      - -m
+      - "${artifact}"
+      - -x
+      - "${signature}"
+      - -t
+      - "Brinco checksums signature"
+
 release:
   github:
     owner: yerlinson10

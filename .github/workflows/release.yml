@@ -24,6 +24,24 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Prepare minisign private key
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then
+            echo "MINISIGN_SECRET_KEY no esta configurado en secretos." >&2
+            exit 1
+          fi
+          keyfile="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "${{ secrets.MINISIGN_SECRET_KEY }}" > "$keyfile"
+          chmod 600 "$keyfile"
+          echo "MINISIGN_SECRET_KEY_FILE=$keyfile" >> "$GITHUB_ENV"
+
       - name: Run GoReleaser
         if: github.event_name == 'release'
         uses: goreleaser/goreleaser-action@v6
@@ -34,6 +52,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY_FILE: ${{ env.MINISIGN_SECRET_KEY_FILE }}
 
       - name: Run GoReleaser snapshot (manual)
         if: github.event_name != 'release'
@@ -41,7 +60,7 @@ jobs:
         with:
           distribution: goreleaser
           version: ~> v2
-          args: release --clean --snapshot
+          args: release --clean --snapshot --skip=signs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
