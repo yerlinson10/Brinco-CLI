@@ -15,7 +15,7 @@ import (
 	"brinco-cli/internal/updater"
 )
 
-const version = "0.2.0"
+const version = "1.2.1"
 
 const mainHelpText = `Chat P2P / relay / TCP
 

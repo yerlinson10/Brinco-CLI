@@ -617,15 +617,16 @@ func (n *Node) receiveLoop() {
 		if msg.GetFrom() == n.host.ID() || msg.ReceivedFrom == n.host.ID() {
 			continue
 		}
+		// Los mensajes cifrados son JSON {"nonce","cipher"}; si primero se decodifica
+		// como chatMessage el unmarshal no falla (campos ignorados) y nunca se descifra.
+		// Hay que intentar descifrado antes que JSON en claro.
 		var cm chatMessage
-		if err := json.Unmarshal(msg.Data, &cm); err != nil {
-			plain, derr := n.decryptPayload(msg.Data)
-			if derr != nil {
-				continue
-			}
+		if plain, derr := n.decryptPayload(msg.Data); derr == nil {
 			if err := json.Unmarshal(plain, &cm); err != nil {
 				continue
 			}
+		} else if err := json.Unmarshal(msg.Data, &cm); err != nil {
+			continue
 		}
 		if cm.From != "" && !n.allowPeer(cm.From) {
 			continue
