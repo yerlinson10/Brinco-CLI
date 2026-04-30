@@ -100,3 +100,18 @@ func enqueueClientWire(c *serverClient, msg wireMessage, context string) bool {
 func acceptShouldStop(err error) bool {
 	return err != nil && errors.Is(err, net.ErrClosed)
 }
+
+// relayPeerIP extrae la IP del cliente TCP para limites por origen.
+func relayPeerIP(addr net.Addr) string {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		if a != nil && a.IP != nil {
+			return a.IP.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil && host != "" {
+		return host
+	}
+	return addr.String()
+}

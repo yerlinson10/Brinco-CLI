@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"brinco-cli/internal/clipboard"
@@ -17,10 +20,20 @@ import (
 
 type relayHub struct {
 	publicAddr string
-	ln         net.Listener
 
 	mu    sync.Mutex
 	rooms map[string]*relayRoom
+
+	maxPerIP int
+	maxTotal int
+
+	ipMu       sync.Mutex
+	ipCounts   map[string]int
+	totalConns int
+
+	connMu sync.Mutex
+	active map[net.Conn]struct{}
+	wg     sync.WaitGroup
 }
 
 type relayRoom struct {
@@ -60,8 +73,8 @@ func RunCreateUsingRelayWithProtocol(name, relayAddr, password, protocol string)
 	return runRelayClient(best, "", name, password, "", true, protocol)
 }
 
-func RunRelayServer(listenAddr, publicAddr string) int {
-	logx.Info("relay server start", "listen", listenAddr, "public", publicAddr)
+func RunRelayServer(listenAddr, publicAddr string, maxPerIP, maxTotal int) int {
+	logx.Info("relay server start", "listen", listenAddr, "public", publicAddr, "maxPerIP", maxPerIP, "maxTotal", maxTotal)
 	if strings.TrimSpace(listenAddr) == "" {
 		listenAddr = "0.0.0.0:10000"
 	}
@@ -83,17 +96,39 @@ func RunRelayServer(listenAddr, publicAddr string) int {
 
 	hub := &relayHub{
 		publicAddr: publicAddr,
-		ln:         ln,
 		rooms:      make(map[string]*relayRoom),
+		maxPerIP:   maxPerIP,
+		maxTotal:   maxTotal,
+		ipCounts:   make(map[string]int),
+		active:     make(map[net.Conn]struct{}),
 	}
 
 	fmt.Printf("Relay escuchando en %s\n", listenAddr)
 	fmt.Printf("Relay publico en %s\n", publicAddr)
+	if maxPerIP > 0 {
+		fmt.Printf("Limite por IP: %d conexiones TCP simultaneas\n", maxPerIP)
+	}
+	if maxTotal > 0 {
+		fmt.Printf("Limite global: %d conexiones TCP simultaneas\n", maxTotal)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, relayShutdownSignals()...)
+	go func() {
+		<-sigCh
+		logx.Info("relay server shutdown signal")
+		_ = ln.Close()
+		hub.shutdownAllConns()
+	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if acceptShouldStop(err) {
+				signal.Stop(sigCh)
+				hub.shutdownAllConns()
+				hub.wg.Wait()
+				fmt.Println("Relay detenido.")
 				return 0
 			}
 			logx.Warn("relay accept", "err", err)
@@ -101,8 +136,80 @@ func RunRelayServer(listenAddr, publicAddr string) int {
 			continue
 		}
 		logx.Debug("relay connection accepted", "remote", conn.RemoteAddr().String())
-		go hub.handleConn(conn)
+		ipKey, ok := hub.tryEnter(conn.RemoteAddr())
+		if !ok {
+			logx.Warn("relay connection rejected", "reason", "limit", "remote", conn.RemoteAddr().String())
+			_ = conn.Close()
+			continue
+		}
+		hub.wg.Add(1)
+		go func(c net.Conn, ip string) {
+			defer hub.wg.Done()
+			defer hub.leave(ip)
+			hub.addActive(c)
+			defer hub.removeActive(c)
+			hub.handleConn(c)
+		}(conn, ipKey)
 	}
+}
+
+func relayShutdownSignals() []os.Signal {
+	if runtime.GOOS == "windows" {
+		return []os.Signal{os.Interrupt}
+	}
+	return []os.Signal{os.Interrupt, syscall.SIGTERM}
+}
+
+func (h *relayHub) tryEnter(addr net.Addr) (ip string, ok bool) {
+	ip = relayPeerIP(addr)
+	h.ipMu.Lock()
+	defer h.ipMu.Unlock()
+	if h.maxTotal > 0 && h.totalConns >= h.maxTotal {
+		return ip, false
+	}
+	if h.maxPerIP > 0 {
+		if h.ipCounts[ip] >= h.maxPerIP {
+			return ip, false
+		}
+	}
+	h.totalConns++
+	h.ipCounts[ip]++
+	return ip, true
+}
+
+func (h *relayHub) leave(ip string) {
+	h.ipMu.Lock()
+	defer h.ipMu.Unlock()
+	if h.totalConns > 0 {
+		h.totalConns--
+	}
+	n := h.ipCounts[ip]
+	if n <= 1 {
+		delete(h.ipCounts, ip)
+	} else {
+		h.ipCounts[ip] = n - 1
+	}
+}
+
+func (h *relayHub) addActive(c net.Conn) {
+	h.connMu.Lock()
+	h.active[c] = struct{}{}
+	h.connMu.Unlock()
+}
+
+func (h *relayHub) removeActive(c net.Conn) {
+	h.connMu.Lock()
+	delete(h.active, c)
+	h.connMu.Unlock()
+}
+
+func (h *relayHub) shutdownAllConns() {
+	h.connMu.Lock()
+	for c := range h.active {
+		_ = c.Close()
+	}
+	h.active = make(map[net.Conn]struct{})
+	h.connMu.Unlock()
 }
 
 func (h *relayHub) handleConn(conn net.Conn) {
@@ -213,7 +320,7 @@ func (h *relayHub) handleConn(conn net.Conn) {
 			continue
 		}
 		decodeFails = 0
-		if !client.allowMessage() {
+		if msg.Type != msgTypeFileChunk && !client.allowMessage() {
 			enqueueClientWire(client, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()}, "rate_limit")
 			continue
 		}

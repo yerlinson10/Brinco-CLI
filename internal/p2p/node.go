@@ -138,7 +138,6 @@ type incomingP2PFileTransfer struct {
 	chunks      [][]byte
 	got         []bool
 	received    int
-	lastPercent int
 	updatedAt   time.Time
 }
 
@@ -773,7 +772,7 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 		n.trackPeerPubKey(senderPeerID, cm.PubKey)
-		if !n.allowPeer(senderPeerID) {
+		if cm.Type != "file_chunk" && !n.allowPeer(senderPeerID) {
 			continue
 		}
 		if cm.Fingerprint != "" && !n.trackFingerprint(senderPeerID, cm.Fingerprint) {
@@ -921,8 +920,6 @@ func renderMessage(msg chatMessage, myNick string) {
 		if result.Done {
 			triggerP2PNotification(msg, myNick)
 			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
-		} else if result.Percent > 0 {
-			fmt.Printf("[%s] recibiendo %s de %s: %d%%\n", t, msg.FileName, fromLabel, result.Percent)
 		}
 	}
 }
@@ -1193,8 +1190,6 @@ func (n *Node) sendFile(path string) error {
 		if err := n.publishMessage(msg); err != nil {
 			return err
 		}
-		percent := ((i + 1) * 100) / chunkCount
-		fmt.Printf("enviando %s: %d%%\n", name, percent)
 	}
 	t := time.Now().Format("15:04:05")
 	fmt.Printf("[%s] %s envio archivo %s (%s, sha256=%s)\n", t, displayNickP2P(n.name, n.name), name, formatBytes(int64(len(raw))), checksum)
@@ -1214,11 +1209,10 @@ func saveIncomingP2PFile(msg chatMessage) (string, int, error) {
 }
 
 type p2pFileChunkResult struct {
-	Path    string
-	Size    int
-	Percent int
-	Done    bool
-	Err     error
+	Path string
+	Size int
+	Done bool
+	Err  error
 }
 
 func saveIncomingP2PFileChunk(msg chatMessage) p2pFileChunkResult {
@@ -1253,12 +1247,7 @@ func saveIncomingP2PFileChunk(msg chatMessage) p2pFileChunkResult {
 		tr.chunks[msg.ChunkIndex] = raw
 		tr.received++
 	}
-	percent := (tr.received * 100) / len(tr.chunks)
 	if tr.received < len(tr.chunks) {
-		if percent >= tr.lastPercent+10 || percent == 100 {
-			tr.lastPercent = percent
-			return p2pFileChunkResult{Percent: percent}
-		}
 		return p2pFileChunkResult{}
 	}
 	assembled := make([]byte, 0, tr.totalSize)
@@ -1277,7 +1266,7 @@ func saveIncomingP2PFileChunk(msg chatMessage) p2pFileChunkResult {
 		return p2pFileChunkResult{Err: err}
 	}
 	delete(incomingP2PFiles, msg.TransferID)
-	return p2pFileChunkResult{Path: path, Size: len(assembled), Percent: 100, Done: true}
+	return p2pFileChunkResult{Path: path, Size: len(assembled), Done: true}
 }
 
 func validP2PFileChunk(msg chatMessage) bool {

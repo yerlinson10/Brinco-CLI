@@ -113,7 +113,6 @@ type incomingFileTransfer struct {
 	chunks      [][]byte
 	got         []bool
 	received    int
-	lastPercent int
 	cleanup     *time.Timer
 	ttlBump     uint64
 }
@@ -529,7 +528,8 @@ func (s *roomServer) handleConn(conn net.Conn) {
 }
 
 func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
-	if !c.allowMessage() {
+	// file_chunk envia muchas lineas seguidas; el rate limit de chat no debe descartarlas.
+	if msg.Type != msgTypeFileChunk && !c.allowMessage() {
 		enqueueClientWire(c, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()}, "rate_limit")
 		return
 	}
@@ -1221,8 +1221,6 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 		if result.Done {
 			triggerNotification(msg, myNick)
 			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
-		} else if result.Percent > 0 {
-			fmt.Printf("[%s] recibiendo %s de %s: %d%%\n", t, msg.FileName, fromLabel, result.Percent)
 		}
 	}
 }
@@ -1399,12 +1397,10 @@ func sendFileChunks(conn net.Conn, path string) error {
 	if err != nil {
 		return err
 	}
-	for i, msg := range chunks {
+	for _, msg := range chunks {
 		if err := writeMessage(conn, msg); err != nil {
 			return err
 		}
-		percent := ((i + 1) * 100) / len(chunks)
-		fmt.Printf("enviando %s: %d%%\n", name, percent)
 	}
 	fmt.Printf("archivo enviado: %s (%s, sha256=%s)\n", name, formatBytes(total), checksum)
 	return nil
@@ -1463,11 +1459,10 @@ func buildFileChunks(path string) ([]wireMessage, int64, string, string, error) 
 }
 
 type fileChunkResult struct {
-	Path    string
-	Size    int
-	Percent int
-	Done    bool
-	Err     error
+	Path string
+	Size int
+	Done bool
+	Err  error
 }
 
 func rescheduleIncomingFileTTL(transferID string, tr *incomingFileTransfer) {
@@ -1539,12 +1534,7 @@ func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 		tr.received++
 	}
 	rescheduleIncomingFileTTL(msg.TransferID, tr)
-	percent := (tr.received * 100) / len(tr.chunks)
 	if tr.received < len(tr.chunks) {
-		if percent >= tr.lastPercent+10 || percent == 100 {
-			tr.lastPercent = percent
-			return fileChunkResult{Percent: percent}
-		}
 		return fileChunkResult{}
 	}
 
@@ -1571,7 +1561,7 @@ func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 	}
 	stopIncomingFileTTL(tr)
 	delete(incomingFiles, msg.TransferID)
-	return fileChunkResult{Path: path, Size: len(assembled), Percent: 100, Done: true}
+	return fileChunkResult{Path: path, Size: len(assembled), Done: true}
 }
 
 func validFileChunk(msg wireMessage) bool {

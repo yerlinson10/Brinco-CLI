@@ -31,7 +31,7 @@ Permite crear una sala desde la terminal, compartir un código y chatear. El com
 
 | Requisito | Version minima |
 |-----------|-----------------|
-| Go (solo si compilas desde fuente) | 1.22 |
+| Go (solo si compilas desde fuente) | 1.25+ (ver `go.mod` del repo) |
 | Terminal | ANSI recomendado (colores) |
 | Red | Internet si los peers están en redes distintas (según modo) |
 
@@ -217,9 +217,14 @@ go run ./cmd/brinco room join --name Luis --code guaranteed-...
 
 ### relay (servidor TCP propio)
 
+El transporte es **TCP en claro** entre clientes y relay: no sustituye VPN/TLS en redes no confiables. En **p2p/guaranteed** el payload de chat va cifrado con secreto derivado del codigo de sala (modelo tipo “quien tenga el codigo”).
+
 ```bash
-# 1) Maquina con IP publica
+# 1) Maquina con IP publica (Ctrl+C detiene el relay y corta conexiones abiertas)
 go run ./cmd/brinco relay serve --listen 0.0.0.0:10000 --public TU_IP_PUBLICA:10000
+
+# Limites opcionales contra abuso (por defecto 64 TCP por IP; 0 = sin limite por IP)
+go run ./cmd/brinco relay serve --listen 0.0.0.0:10000 --public TU_IP_PUBLICA:10000 --max-per-ip 32 --max-connections 500
 
 # 2) Crear sala (password opcional; omite --password para sala abierta)
 go run ./cmd/brinco room create --mode relay --name Ana --relay TU_IP_PUBLICA:10000 --password clave123
@@ -280,7 +285,9 @@ go run ./cmd/brinco room code
 
 ### `relay serve`
 
-Relay TCP para salas **relay**. Detalle de flags: `brinco relay help`.
+Relay TCP para salas **relay**. Flags: `brinco relay help` (`--max-per-ip`, `--max-connections`, cierre con Ctrl+C o SIGTERM en Unix).
+
+Completado bash opcional: [completions/brinco.bash](completions/brinco.bash) (carga con `source` desde tu `~/.bashrc` o similar).
 
 ### `update`
 

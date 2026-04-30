@@ -98,8 +98,12 @@ Formas equivalentes:
   brinco relay --listen 0.0.0.0:10000 --public IP:10000
 
 FLAGS
-  --listen   local (default 0.0.0.0:10000)
-  --public   host:puerto publico (obligatorio si escuchas en 0.0.0.0)
+  --listen           local (default 0.0.0.0:10000)
+  --public           host:puerto publico (obligatorio si escuchas en 0.0.0.0)
+  --max-per-ip N     max conexiones TCP simultaneas por IP (default 64; 0 = sin limite)
+  --max-connections N  max conexiones totales al relay (default 0 = sin limite)
+
+Ctrl+C (Windows) o Ctrl+C/SIGTERM (Unix) detiene el relay y cierra conexiones abiertas.
 `
 
 const updateHelpText = `brinco update — GitHub Releases (yerlinson10/Brinco-CLI)
@@ -191,8 +195,17 @@ func runDoctor(args []string) int {
 	}
 	fmt.Println()
 	fmt.Println("Diagnostico verbose")
+	if lv := strings.TrimSpace(os.Getenv("BRINCO_LOG_LEVEL")); lv != "" {
+		fmt.Printf("BRINCO_LOG_LEVEL=%s\n", lv)
+	}
 	if p := logx.Path(); p != "" {
 		fmt.Printf("log: %s\n", p)
+		dir := filepath.Dir(p)
+		if fi, err := os.Stat(dir); err != nil {
+			fmt.Printf("log dir: %s (stat: %v)\n", dir, err)
+		} else {
+			fmt.Printf("log dir: %s (perm %04o)\n", dir, fi.Mode().Perm())
+		}
 	}
 	printDoctorNetwork()
 	relays := chat.SplitRelayList(*relay)
@@ -607,10 +620,20 @@ func runRelay(args []string) int {
 	fs.SetOutput(os.Stderr)
 	listen := fs.String("listen", "0.0.0.0:10000", "Direccion local del relay host:puerto")
 	public := fs.String("public", "", "Direccion publica del relay host:puerto")
+	maxPerIP := fs.Int("max-per-ip", 64, "Max conexiones TCP simultaneas por misma IP; 0 = sin limite")
+	maxTotal := fs.Int("max-connections", 0, "Max conexiones TCP totales al relay; 0 = sin limite")
 	if c := checkFlagParse(fs, fs.Parse(serveArgs), "relay"); c != 0 {
 		return c
 	}
-	return chat.RunRelayServer(*listen, *public)
+	if *maxPerIP < 0 {
+		fmt.Fprintln(os.Stderr, "Error: --max-per-ip no puede ser negativo")
+		return 1
+	}
+	if *maxTotal < 0 {
+		fmt.Fprintln(os.Stderr, "Error: --max-connections no puede ser negativo")
+		return 1
+	}
+	return chat.RunRelayServer(*listen, *public, *maxPerIP, *maxTotal)
 }
 
 func printRoomHelp() {
