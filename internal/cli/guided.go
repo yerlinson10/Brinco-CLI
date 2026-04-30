@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,55 @@ import (
 	"brinco-cli/internal/chat"
 	p2pcmd "brinco-cli/internal/p2p"
 )
+
+func validateTCPHostPort(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return errors.New("dirección vacía")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("formato host:puerto inválido: %w", err)
+	}
+	if host == "" {
+		return errors.New("falta el host (ej. 127.0.0.1:10000)")
+	}
+	if port == "" {
+		return errors.New("falta el puerto")
+	}
+	return nil
+}
+
+func isAffirmative(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "s", "si", "sí", "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// readRelayTCPHostPortAndPassword pide relay TCP (obligatorio), valida host:puerto y la contraseña opcional de sala.
+func readRelayTCPHostPortAndPassword(prompt, def, emptyErrMsg string) (relay, password string, exitCode int) {
+	var err error
+	relay, err = readLineTrimOrDefault(prompt, def)
+	if err != nil {
+		return "", "", 1
+	}
+	if strings.TrimSpace(relay) == "" {
+		fmt.Fprintln(os.Stderr, emptyErrMsg)
+		return "", "", 1
+	}
+	if err := validateTCPHostPort(relay); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: relay: %v\n", err)
+		return "", "", 1
+	}
+	password, err = readOptionalPasswordLine()
+	if err != nil {
+		return "", "", 1
+	}
+	return relay, password, 0
+}
 
 func runHostGuided() int {
 	fmt.Fprintln(os.Stderr, "")
@@ -42,54 +92,65 @@ func runHostGuided() int {
 	password := ""
 
 	switch mode {
+	case "guaranteed":
+		fmt.Fprintln(os.Stderr, "Modo garantizado: no se solicitan relay ni contraseña en este asistente.")
 	case "relay":
-		relay, err = readLineTrimOrDefault("Direccion del relay TCP host:puerto [127.0.0.1:10000]: ", "127.0.0.1:10000")
-		if err != nil {
-			return 1
-		}
-		if strings.TrimSpace(relay) == "" {
-			fmt.Fprintln(os.Stderr, "Error: relay obligatorio en modo relay")
-			return 1
-		}
-		password, err = readOptionalPasswordLine()
-		if err != nil {
-			return 1
+		var ec int
+		relay, password, ec = readRelayTCPHostPortAndPassword(
+			"Dirección del relay TCP host:puerto [127.0.0.1:10000]: ",
+			"127.0.0.1:10000",
+			"Error: relay obligatorio en modo relay",
+		)
+		if ec != 0 {
+			return ec
 		}
 	case "direct":
 		listen, err = readLineTrimOrDefault("Escucha local (listen) [0.0.0.0:9090]: ", "0.0.0.0:9090")
 		if err != nil {
 			return 1
 		}
-		public, err = readLineTrim("Host:puerto publico (--public, obligatorio si escuchas en 0.0.0.0): ")
+		if err := validateTCPHostPort(listen); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: escucha (listen): %v\n", err)
+			return 1
+		}
+		public, err = readLineTrim("Host:puerto público (--public, obligatorio si escuchas en 0.0.0.0): ")
 		if err != nil {
 			return 1
 		}
 		if isWildcardListen(listen) && strings.TrimSpace(public) == "" {
-			fmt.Fprintln(os.Stderr, "Error: con 0.0.0.0 debes indicar host:puerto publico")
+			fmt.Fprintln(os.Stderr, "Error: con 0.0.0.0 debes indicar host:puerto público")
 			return 1
 		}
-		useRelay, err := readLineTrimOrDefault("Crear sala sobre relay TCP en vez de servidor propio? (s/N) [N]: ", "n")
+		if strings.TrimSpace(public) != "" {
+			if err := validateTCPHostPort(public); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: público: %v\n", err)
+				return 1
+			}
+		}
+		useRelay, err := readLineTrimOrDefault("¿Crear sala sobre relay TCP en vez de servidor propio? (s/N) [N]: ", "n")
 		if err != nil {
 			return 1
 		}
-		if strings.EqualFold(strings.TrimSpace(useRelay), "s") || strings.EqualFold(strings.TrimSpace(useRelay), "si") {
-			relay, err = readLineTrimOrDefault("Relay host:puerto [127.0.0.1:10000]: ", "127.0.0.1:10000")
-			if err != nil {
-				return 1
-			}
-			if strings.TrimSpace(relay) == "" {
-				fmt.Fprintln(os.Stderr, "Error: relay obligatorio si eliges relay")
-				return 1
+		if isAffirmative(useRelay) {
+			var ec int
+			relay, password, ec = readRelayTCPHostPortAndPassword(
+				"Relay host:puerto [127.0.0.1:10000]: ",
+				"127.0.0.1:10000",
+				"Error: relay obligatorio si eliges relay",
+			)
+			if ec != 0 {
+				return ec
 			}
 			mode = "direct"
 			direct = true
-		}
-		password, err = readOptionalPasswordLine()
-		if err != nil {
-			return 1
+		} else {
+			password, err = readOptionalPasswordLine()
+			if err != nil {
+				return 1
+			}
 		}
 	case "p2p":
-		relay, err = readLineTrim("Relay libp2p multiaddr (opcional, Enter vacio): ")
+		relay, err = readLineTrim("Relay libp2p multiaddr (opcional, Enter vacío): ")
 		if err != nil {
 			return 1
 		}
@@ -103,19 +164,23 @@ func runJoinGuided() int {
 	fmt.Fprintln(os.Stderr, "=== Unirse a sala (asistente) ===")
 	fmt.Fprintln(os.Stderr, "")
 
-	code, err := readLineTrim("Codigo de sala (Enter para usar el ultimo guardado en disco): ")
+	code, err := readLineTrim("Código de sala (Enter para usar el último guardado en disco): ")
 	if err != nil {
 		return 1
 	}
 	code = strings.TrimSpace(code)
 	if code == "" {
-		var e error
-		code, e = loadAnyLastRoomCode()
-		if e != nil || strings.TrimSpace(code) == "" {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", e)
+		var loadErr error
+		code, loadErr = loadAnyLastRoomCode()
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", loadErr)
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "Usando codigo guardado.\n")
+		if strings.TrimSpace(code) == "" {
+			fmt.Fprintln(os.Stderr, "Error: no hay código de sala guardado.")
+			return 1
+		}
+		fmt.Fprintln(os.Stderr, "Usando código guardado.")
 	}
 
 	name, err := readLineTrimOrDefault("Nombre visible [guest]: ", "guest")
