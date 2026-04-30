@@ -3,24 +3,33 @@ package cli
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	"brinco-cli/internal/roomproto"
 )
 
+// stdin is a single buffered reader for os.Stdin so sequential prompts do not
+// attach multiple bufio.Reader instances to the same file descriptor.
+var stdin = bufio.NewReader(os.Stdin)
+
 func readLineTrim(prompt string) (string, error) {
-	fmt.Fprint(os.Stderr, prompt)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil {
+	if _, err := fmt.Fprint(os.Stderr, prompt); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(line), nil
-}
-
-func readPasswordLine(prompt string) (string, error) {
-	fmt.Fprintf(os.Stderr, "%s (visible al escribir): ", strings.TrimSpace(prompt))
-	return readLineTrim("")
+	line, err := stdin.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if err != nil {
+		if err == io.EOF {
+			if line == "" {
+				return "", io.EOF
+			}
+			return line, nil
+		}
+		return "", err
+	}
+	return line, nil
 }
 
 func readLineTrimOrDefault(prompt, defaultVal string) (string, error) {
@@ -28,10 +37,10 @@ func readLineTrimOrDefault(prompt, defaultVal string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(s) == "" {
+	if s == "" {
 		return defaultVal, nil
 	}
-	return strings.TrimSpace(s), nil
+	return s, nil
 }
 
 func readOptionalPasswordLine() (string, error) {
@@ -40,7 +49,7 @@ func readOptionalPasswordLine() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(s), nil
+	return s, nil
 }
 
 func looksLikeRoomCode(s string) bool {
