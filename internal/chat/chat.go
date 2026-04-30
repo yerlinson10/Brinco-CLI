@@ -147,12 +147,13 @@ func (t *roomHostTracker) get() string {
 }
 
 type serverClient struct {
-	name   string
-	conn   net.Conn
-	send   chan wireMessage
-	last   time.Time
-	tokens float64
-	isHost bool
+	name     string
+	conn     net.Conn
+	send     chan wireMessage
+	last     time.Time
+	tokens   float64
+	isHost   bool
+	joinedAt time.Time
 }
 
 type inputRateLimiter struct {
@@ -240,7 +241,7 @@ func RunJoin(name, code, password string) int {
 	addr := payload.Addr
 	relays := payload.relayCandidates()
 	if len(relays) > 0 {
-		best, results := SelectBestTCPRelay(relays, 900*time.Millisecond)
+		best, results := SelectBestTCPRelay(relays, relayProbeTimeout)
 		printRelayProbeResults(results)
 		if best != "" {
 			addr = best
@@ -413,7 +414,12 @@ func (s *roomServer) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
-			return
+			if acceptShouldStop(err) {
+				return
+			}
+			logx.Warn("chat accept", "err", err)
+			time.Sleep(acceptErrBackoff)
+			continue
 		}
 		go s.handleConn(conn)
 	}
@@ -423,7 +429,20 @@ func (s *roomServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	writerDone := make(chan struct{})
-	client := &serverClient{conn: conn, send: make(chan wireMessage, 32)}
+	client := &serverClient{conn: conn, send: make(chan wireMessage, clientSendChanCap)}
+	joined := false
+	defer func() {
+		if !joined {
+			close(client.send)
+			<-writerDone
+			return
+		}
+		s.removeClient(client)
+		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s salio", client.name), At: time.Now().Unix()}, nil)
+		close(client.send)
+		<-writerDone
+	}()
+
 	go func() {
 		defer close(writerDone)
 		for msg := range client.send {
@@ -434,31 +453,31 @@ func (s *roomServer) handleConn(conn net.Conn) {
 	}()
 
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+	scanner.Buffer(make([]byte, 0, scannerTokenInitial), scannerTokenMax)
 
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout)); err != nil {
+		logx.Debug("chat handshake deadline", "err", err)
+	}
 	if !scanner.Scan() {
-		close(client.send)
-		<-writerDone
+		_ = conn.SetReadDeadline(time.Time{})
+		if err := scanner.Err(); err != nil {
+			logx.Debug("chat handshake scan", "err", err)
+		}
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 
 	join, err := decodeMessage(scanner.Text())
 	if err != nil || join.Type != msgTypeJoin {
-		sendDirect(client, wireMessage{Type: msgTypeError, Text: "handshake invalido", At: time.Now().Unix()})
-		close(client.send)
-		<-writerDone
+		enqueueClientWire(client, wireMessage{Type: msgTypeError, Text: "handshake invalido", At: time.Now().Unix()}, "handshake")
 		return
 	}
 	if join.Room != s.roomID {
-		sendDirect(client, wireMessage{Type: msgTypeError, Text: "sala inexistente", At: time.Now().Unix()})
-		close(client.send)
-		<-writerDone
+		enqueueClientWire(client, wireMessage{Type: msgTypeError, Text: "sala inexistente", At: time.Now().Unix()}, "handshake")
 		return
 	}
 	if hashPassword(join.Text) != s.passwordHash {
-		sendDirect(client, wireMessage{Type: msgTypeError, Text: "password incorrecta", At: time.Now().Unix()})
-		close(client.send)
-		<-writerDone
+		enqueueClientWire(client, wireMessage{Type: msgTypeError, Text: "password incorrecta", At: time.Now().Unix()}, "handshake")
 		return
 	}
 
@@ -467,15 +486,14 @@ func (s *roomServer) handleConn(conn net.Conn) {
 		name = "anon"
 	}
 	if s.isBannedName(name) {
-		sendDirect(client, wireMessage{Type: msgTypeError, Text: "estas baneado de esta sala", At: time.Now().Unix()})
-		close(client.send)
-		<-writerDone
+		enqueueClientWire(client, wireMessage{Type: msgTypeError, Text: "estas baneado de esta sala", At: time.Now().Unix()}, "handshake")
 		return
 	}
 	client.name = s.uniqueName(name)
 	s.addClient(client)
+	joined = true
 
-	sendDirect(client, wireMessage{
+	enqueueClientWire(client, wireMessage{
 		Type:     msgTypeWelcome,
 		Text:     "Conectado a la sala",
 		Code:     s.code,
@@ -483,34 +501,39 @@ func (s *roomServer) handleConn(conn net.Conn) {
 		Assigned: client.name,
 		Host:     s.currentHostName(),
 		At:       time.Now().Unix(),
-	})
+	}, "welcome")
 	s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s se unio", client.name), At: time.Now().Unix()}, nil)
 
+	decodeFails := 0
 	for scanner.Scan() {
 		msg, err := decodeMessage(scanner.Text())
 		if err != nil {
+			decodeFails++
+			if decodeFails >= maxDecodeFailures {
+				logx.Warn("chat decode failures closing", "remote", conn.RemoteAddr().String())
+				return
+			}
 			continue
 		}
+		decodeFails = 0
 		s.handleClientMessage(client, msg)
 		if msg.Type == msgTypeQuit {
-			break
+			return
 		}
 	}
-
-	s.removeClient(client)
-	s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s salio", client.name), At: time.Now().Unix()}, nil)
-	close(client.send)
-	<-writerDone
+	if err := scanner.Err(); err != nil {
+		logx.Debug("chat scanner exit", "err", err)
+	}
 }
 
 func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 	if !c.allowMessage() {
-		sendDirect(c, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()})
+		enqueueClientWire(c, wireMessage{Type: msgTypeError, Text: "rate limit excedido", At: time.Now().Unix()}, "rate_limit")
 		return
 	}
 	if msg.Type != msgTypePeersReq && msg.Type != msgTypeDiagReq && msg.Type != msgTypeQuit && msg.Type != msgTypeModCmd {
 		if s.isMuted(c.name) {
-			sendDirect(c, wireMessage{Type: msgTypeError, Text: "estas silenciado por el host", At: time.Now().Unix()})
+			enqueueClientWire(c, wireMessage{Type: msgTypeError, Text: "estas silenciado por el host", At: time.Now().Unix()}, "muted")
 			return
 		}
 	}
@@ -522,9 +545,9 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 		}
 		s.broadcast(wireMessage{Type: msgTypeChat, From: c.name, Text: text, At: time.Now().Unix()}, nil)
 	case msgTypePeersReq:
-		sendDirect(c, wireMessage{Type: msgTypePeers, Peers: s.peerNames(), At: time.Now().Unix()})
+		enqueueClientWire(c, wireMessage{Type: msgTypePeers, Peers: s.peerNames(), At: time.Now().Unix()}, "peers")
 	case msgTypeDiagReq:
-		sendDirect(c, wireMessage{Type: msgTypeDiag, State: "connected", RTTMs: 0, RelayUsed: false, NATEst: "desconocido", At: time.Now().Unix()})
+		enqueueClientWire(c, wireMessage{Type: msgTypeDiag, State: "connected", RTTMs: 0, RelayUsed: false, NATEst: "desconocido", At: time.Now().Unix()}, "diag")
 	case msgTypePrivate:
 		if strings.TrimSpace(msg.To) == "" || strings.TrimSpace(msg.Text) == "" {
 			return
@@ -579,6 +602,7 @@ func (s *roomServer) addClient(c *serverClient) {
 	if len(s.clients) == 0 {
 		c.isHost = true
 	}
+	c.joinedAt = time.Now()
 	s.clients[c] = struct{}{}
 }
 
@@ -588,14 +612,11 @@ func (s *roomServer) removeClient(c *serverClient) {
 	wasHost := c.isHost
 	delete(s.clients, c)
 	if wasHost {
-		for other := range s.clients {
-			other.isHost = true
-			newHost = other.name
-			select {
-			case other.send <- wireMessage{Type: msgTypeSystem, Text: "Ahora eres host de la sala", At: time.Now().Unix()}:
-			default:
-			}
-			break
+		successor := pickSuccessorHost(s.clients)
+		if successor != nil {
+			successor.isHost = true
+			newHost = successor.name
+			enqueueClientWire(successor, wireMessage{Type: msgTypeSystem, Text: "Ahora eres host de la sala", At: time.Now().Unix()}, "host_transfer")
 		}
 	}
 	s.mu.Unlock()
@@ -611,10 +632,7 @@ func (s *roomServer) broadcast(msg wireMessage, except *serverClient) {
 		if c == except {
 			continue
 		}
-		select {
-		case c.send <- msg:
-		default:
-		}
+		enqueueClientWire(c, msg, "broadcast")
 	}
 }
 
@@ -629,22 +647,13 @@ func (s *roomServer) sendPrivate(from *serverClient, toName, text string) {
 		}
 	}
 	if to == nil {
-		select {
-		case from.send <- wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}:
-		default:
-		}
+		enqueueClientWire(from, wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}, "private")
 		return
 	}
 	msg := wireMessage{Type: msgTypePrivate, From: from.name, To: to.name, Text: text, At: time.Now().Unix()}
-	select {
-	case from.send <- msg:
-	default:
-	}
+	enqueueClientWire(from, msg, "private_echo")
 	if to != from {
-		select {
-		case to.send <- msg:
-		default:
-		}
+		enqueueClientWire(to, msg, "private")
 	}
 }
 
@@ -674,12 +683,12 @@ func (s *roomServer) findClientByName(name string) *serverClient {
 
 func (s *roomServer) handleModerationCommand(sender *serverClient, line string) {
 	if !sender.isHost {
-		sendDirect(sender, wireMessage{Type: msgTypeError, Text: "solo el host puede moderar", At: time.Now().Unix()})
+		enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "solo el host puede moderar", At: time.Now().Unix()}, "mod")
 		return
 	}
 	cmd, user, ok := parseModerationCommand(line)
 	if !ok {
-		sendDirect(sender, wireMessage{Type: msgTypeError, Text: "uso: /kick|/mute|/unmute|/ban <usuario>", At: time.Now().Unix()})
+		enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "uso: /kick|/mute|/unmute|/ban <usuario>", At: time.Now().Unix()}, "mod")
 		return
 	}
 	target := s.findClientByName(user)
@@ -689,7 +698,7 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		s.muted[normalizeNickKey(user)] = true
 		s.mu.Unlock()
 		if target != nil {
-			sendDirect(target, wireMessage{Type: msgTypeSystem, Text: "Has sido silenciado por el host", At: time.Now().Unix()})
+			enqueueClientWire(target, wireMessage{Type: msgTypeSystem, Text: "Has sido silenciado por el host", At: time.Now().Unix()}, "mod")
 		}
 		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s fue silenciado por el host", user), At: time.Now().Unix()}, nil)
 	case "/unmute":
@@ -697,15 +706,15 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		delete(s.muted, normalizeNickKey(user))
 		s.mu.Unlock()
 		if target != nil {
-			sendDirect(target, wireMessage{Type: msgTypeSystem, Text: "Ya no estas silenciado", At: time.Now().Unix()})
+			enqueueClientWire(target, wireMessage{Type: msgTypeSystem, Text: "Ya no estas silenciado", At: time.Now().Unix()}, "mod")
 		}
 		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s ya puede escribir", user), At: time.Now().Unix()}, nil)
 	case "/kick":
 		if target == nil {
-			sendDirect(sender, wireMessage{Type: msgTypeError, Text: "usuario no encontrado", At: time.Now().Unix()})
+			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "usuario no encontrado", At: time.Now().Unix()}, "mod")
 			return
 		}
-		sendDirect(target, wireMessage{Type: msgTypeError, Text: "expulsado por el host", At: time.Now().Unix()})
+		enqueueClientWire(target, wireMessage{Type: msgTypeError, Text: "expulsado por el host", At: time.Now().Unix()}, "kick")
 		_ = target.conn.Close()
 	case "/ban":
 		s.mu.Lock()
@@ -713,7 +722,7 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		delete(s.muted, normalizeNickKey(user))
 		s.mu.Unlock()
 		if target != nil {
-			sendDirect(target, wireMessage{Type: msgTypeError, Text: "baneado por el host", At: time.Now().Unix()})
+			enqueueClientWire(target, wireMessage{Type: msgTypeError, Text: "baneado por el host", At: time.Now().Unix()}, "ban")
 			_ = target.conn.Close()
 		}
 		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s fue baneado por el host", user), At: time.Now().Unix()}, nil)
@@ -766,16 +775,7 @@ func (s *roomServer) uniqueName(base string) string {
 	for c := range s.clients {
 		used[c.name] = true
 	}
-	if !used[base] {
-		return base
-	}
-	for i := 2; i < 10000; i++ {
-		candidate := fmt.Sprintf("%s#%d", base, i)
-		if !used[candidate] {
-			return candidate
-		}
-	}
-	return fmt.Sprintf("%s#x", base)
+	return allocUniqueNick(base, func(n string) bool { return used[n] })
 }
 
 func runClient(addr, roomID, name, password, roomCode string) int {
@@ -804,7 +804,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	go func() {
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
-		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		scanner.Buffer(make([]byte, 0, scannerTokenInitial), scannerTokenMax)
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
@@ -831,7 +831,23 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	fmt.Println("Escribe mensajes y Enter para enviar")
 	fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
-	stdin := bufio.NewScanner(os.Stdin)
+	stdinLines := make(chan string, stdinLineChanCap)
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			select {
+			case stdinLines <- line:
+			case <-done:
+				return
+			}
+		}
+		if err := sc.Err(); err != nil {
+			logx.Debug("chat client stdin", "err", err)
+		}
+		close(stdinLines)
+	}()
+
 	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
 	history := make([]string, 0, 50)
 	for {
@@ -844,122 +860,117 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			default:
 			}
 			return 0
-		default:
-		}
-
-		if !stdin.Scan() {
-			_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
-			return 0
-		}
-		line := strings.TrimSpace(stdin.Text())
-		if line == "" {
-			continue
-		}
-		if line == "!!" {
-			if len(history) == 0 {
-				fmt.Println("Historial vacio")
-				continue
-			}
-			line = history[len(history)-1]
-			fmt.Printf("repite: %s\n", line)
-		}
-		history = appendHistory(history, line, 40)
-
-		if isReaction(line) {
-			if !localLimiter.allow() {
-				printRateLimitLocal()
-				continue
-			}
-			_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
-			continue
-		}
-
-		if to, txt, ok := parseAtMention(line); ok {
-			if !localLimiter.allow() {
-				printRateLimitLocal()
-				continue
-			}
-			_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
-			continue
-		}
-
-		if strings.HasPrefix(line, "/") {
-			switch line {
-			case "/quit":
+		case line, ok := <-stdinLines:
+			if !ok {
 				_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
 				return 0
-			case "/peers":
-				_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
-			case "/diag":
-				_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
-			case "/code":
-				if strings.TrimSpace(roomCode) != "" {
-					fmt.Printf("Codigo de sala: %s\n", roomCode)
-				} else {
-					fmt.Println("No hay codigo disponible en esta sesion")
-				}
-			case "/help":
-				fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u t | /send archivo /quit /help")
-			case "/clear":
-				clearConsole()
-			case "/history":
-				printInputHistory(history)
-			default:
-				if isModerationCommandLine(line) {
-					if !localLimiter.allow() {
-						printRateLimitLocal()
-						continue
-					}
-					_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
+			}
+			if line == "" {
+				continue
+			}
+			if line == "!!" {
+				if len(history) == 0 {
+					fmt.Println("Historial vacio")
 					continue
 				}
-				if strings.HasPrefix(line, "/msg ") {
-					to, text, ok := parsePrivateCommand(line)
-					if !ok {
-						fmt.Println("Uso: /msg <usuario> <texto>")
-						continue
-					}
-					if !localLimiter.allow() {
-						printRateLimitLocal()
-						continue
-					}
-					_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
-				} else if strings.HasPrefix(line, "/send ") {
-					if !localLimiter.allow() {
-						printRateLimitLocal()
-						continue
-					}
-					if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
-						fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
-					}
-				} else {
-					fmt.Println("Comando no reconocido. Usa /help")
-				}
+				line = history[len(history)-1]
+				fmt.Printf("repite: %s\n", line)
 			}
-			continue
-		}
+			history = appendHistory(history, line, 40)
 
-		if !localLimiter.allow() {
-			printRateLimitLocal()
-			continue
+			if isReaction(line) {
+				if !localLimiter.allow() {
+					printRateLimitLocal()
+					continue
+				}
+				_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
+				continue
+			}
+
+			if to, txt, ok := parseAtMention(line); ok {
+				if !localLimiter.allow() {
+					printRateLimitLocal()
+					continue
+				}
+				_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
+				continue
+			}
+
+			if strings.HasPrefix(line, "/") {
+				switch line {
+				case "/quit":
+					_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
+					return 0
+				case "/peers":
+					_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
+				case "/diag":
+					_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
+				case "/code":
+					if strings.TrimSpace(roomCode) != "" {
+						fmt.Printf("Codigo de sala: %s\n", roomCode)
+					} else {
+						fmt.Println("No hay codigo disponible en esta sesion")
+					}
+				case "/help":
+					fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u t | /send archivo /quit /help")
+				case "/clear":
+					clearConsole()
+				case "/history":
+					printInputHistory(history)
+				default:
+					if isModerationCommandLine(line) {
+						if !localLimiter.allow() {
+							printRateLimitLocal()
+							continue
+						}
+						_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
+						continue
+					}
+					if strings.HasPrefix(line, "/msg ") {
+						to, text, ok := parsePrivateCommand(line)
+						if !ok {
+							fmt.Println("Uso: /msg <usuario> <texto>")
+							continue
+						}
+						if !localLimiter.allow() {
+							printRateLimitLocal()
+							continue
+						}
+						_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
+					} else if strings.HasPrefix(line, "/send ") {
+						if !localLimiter.allow() {
+							printRateLimitLocal()
+							continue
+						}
+						if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
+							fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
+						}
+					} else {
+						fmt.Println("Comando no reconocido. Usa /help")
+					}
+				}
+				continue
+			}
+
+			if !localLimiter.allow() {
+				printRateLimitLocal()
+				continue
+			}
+			at := time.Now().Unix()
+			if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: at}); err != nil {
+				fmt.Fprintf(os.Stderr, "Error enviando mensaje: %v\n", err)
+				return 1
+			}
+			nickMu.RLock()
+			currentNick := myNick
+			nickMu.RUnlock()
+			renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 		}
-		at := time.Now().Unix()
-		if err := writeMessage(conn, wireMessage{Type: msgTypeChat, Text: line, At: at}); err != nil {
-			fmt.Fprintf(os.Stderr, "Error enviando mensaje: %v\n", err)
-			return 1
-		}
-		nickMu.RLock()
-		currentNick := myNick
-		nickMu.RUnlock()
-		renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 	}
 }
 
 func sendDirect(c *serverClient, msg wireMessage) {
-	select {
-	case c.send <- msg:
-	default:
-	}
+	enqueueClientWire(c, msg, "direct")
 }
 
 func decodeMessage(line string) (wireMessage, error) {
