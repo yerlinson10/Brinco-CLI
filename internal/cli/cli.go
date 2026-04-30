@@ -1,8 +1,10 @@
 ﻿package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,7 +21,11 @@ import (
 	"brinco-cli/internal/updater"
 )
 
-const version = "1.2.1"
+const (
+	doctorRelayProbeTimeout = 1200 * time.Millisecond
+	doctorTCPDialTimeout    = 500 * time.Millisecond
+	notifyThrottle          = 250 * time.Millisecond
+)
 
 const mainHelpText = `Chat P2P / relay / TCP
 
@@ -122,7 +128,7 @@ func Run(args []string) int {
 		printMainHelp()
 		return 0
 	case "version", "-v", "--version":
-		fmt.Printf("brinco-cli %s\n", version)
+		fmt.Printf("brinco-cli %s\n", Version())
 		return 0
 	case "doctor":
 		return runDoctor(args[1:])
@@ -144,7 +150,7 @@ func Run(args []string) int {
 }
 
 func printMainHelp() {
-	fmt.Printf("brinco-cli %s\n\n", version)
+	fmt.Printf("brinco-cli %s\n\n", Version())
 	s := mainHelpText
 	if cfg, err := os.UserConfigDir(); err == nil {
 		s = strings.ReplaceAll(s, "%%CONFIG%%", cfg)
@@ -159,10 +165,10 @@ func runDoctor(args []string) int {
 	fs.SetOutput(os.Stderr)
 	verbose := fs.Bool("verbose", false, "Diagnostico extendido")
 	relay := fs.String("relay", "", "Relay(s) host:puerto separados por coma para probar")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	if c := checkFlagParse(fs, fs.Parse(args), "doctor"); c != 0 {
+		return c
 	}
-	fmt.Printf("brinco-cli %s\n", version)
+	fmt.Printf("brinco-cli %s\n", Version())
 	fmt.Printf("go %s  %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	if wd, err := os.Getwd(); err == nil {
 		fmt.Printf("cwd: %s\n", wd)
@@ -197,7 +203,7 @@ func runDoctor(args []string) int {
 		relays = []string{"127.0.0.1:10000"}
 	}
 	fmt.Println("relays:")
-	for _, result := range chat.ProbeTCPRelays(relays, 1200*time.Millisecond) {
+	for _, result := range chat.ProbeTCPRelays(relays, doctorRelayProbeTimeout) {
 		if result.OK {
 			fmt.Printf("- %s ok rtt=%s\n", result.Addr, result.RTT.Round(time.Millisecond))
 		} else {
@@ -205,6 +211,33 @@ func runDoctor(args []string) int {
 		}
 	}
 	return 0
+}
+
+func doctorAddrLooksPrivate(addr net.Addr) bool {
+	switch a := addr.(type) {
+	case *net.IPNet:
+		return ipLooksNonPublic(a.IP)
+	case *net.IPAddr:
+		return ipLooksNonPublic(a.IP)
+	default:
+		s := addr.String()
+		if host, _, err := net.SplitHostPort(s); err == nil {
+			if ip := net.ParseIP(host); ip != nil {
+				return ipLooksNonPublic(ip)
+			}
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			return ipLooksNonPublic(ip)
+		}
+	}
+	return false
+}
+
+func ipLooksNonPublic(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
 }
 
 func printDoctorNetwork() {
@@ -219,8 +252,8 @@ func printDoctorNetwork() {
 		addrs, _ := iface.Addrs()
 		for _, addr := range addrs {
 			s := addr.String()
-			if strings.Contains(s, "10.") || strings.Contains(s, "192.168.") || strings.Contains(s, "172.") || strings.Contains(s, "fd") {
-				nat = "probablemente detras de NAT"
+			if doctorAddrLooksPrivate(addr) {
+				nat = "probablemente detras de NAT o red local"
 			}
 			fmt.Printf("- %s %s\n", iface.Name, s)
 		}
@@ -229,7 +262,7 @@ func printDoctorNetwork() {
 	fmt.Println("puertos comunes:")
 	for _, addr := range []string{"127.0.0.1:9090", "127.0.0.1:10000"} {
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", addr, doctorTCPDialTimeout)
 		if err != nil {
 			fmt.Printf("- %s cerrado/no alcanzable\n", addr)
 			continue
@@ -294,7 +327,7 @@ func applyRuntimeOptions(opts runtimeOptions) {
 	if level == "" {
 		level = notify.LevelAll
 	}
-	notify.Configure(notify.Options{Sound: sound, Level: level, Throttle: 250 * time.Millisecond})
+	notify.Configure(notify.Options{Sound: sound, Level: level, Throttle: notifyThrottle})
 	if limit, err := parseByteLimit(opts.FileLimit); err == nil && limit > 0 {
 		chat.SetMaxFileBytes(limit)
 		p2pcmd.SetMaxFileBytes(limit)
@@ -328,7 +361,14 @@ func parseByteLimit(value string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int64(n * float64(mult)), nil
+	if n < 0 {
+		return 0, errors.New("limite negativo no permitido")
+	}
+	bytes := n * float64(mult)
+	if math.IsInf(bytes, 0) || bytes > float64(math.MaxInt64) {
+		return 0, errors.New("limite demasiado grande")
+	}
+	return int64(bytes), nil
 }
 
 func uniqueStrings(values []string) []string {
@@ -371,14 +411,7 @@ func execRoomJoin(name, code, mode, relay string, direct bool, password string) 
 	if direct {
 		mode = "direct"
 	}
-	if mode == "auto" {
-		p, _ := roomproto.Unwrap(code)
-		if p != "" {
-			mode = p
-		} else {
-			mode = "p2p"
-		}
-	}
+	mode = effectiveJoinMode(mode, code)
 	switch mode {
 	case "p2p":
 		return p2pcmd.RunJoin(name, code, relay)
@@ -398,26 +431,16 @@ func runHost(args []string) int {
 	}
 	fs := flag.NewFlagSet("host", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	name := fs.String("name", "host", "Nombre de usuario")
-	mode := fs.String("mode", "p2p", "Modo: p2p | direct | relay | guaranteed")
-	relay := fs.String("relay", "", "Relay segun modo")
-	direct := fs.Bool("direct", false, "Modo TCP directo")
-	listen := fs.String("listen", "0.0.0.0:9090", "[direct] Escucha local")
-	public := fs.String("public", "", "[direct] Host:puerto publico")
-	password := fs.String("password", "", "Password de la sala")
-	pass := fs.String("pass", "", "Alias de --password")
-	notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
-	notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
-	fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
-	if err := fs.Parse(args); err != nil {
-		return 1
+	f := registerRoomCreateFlags(fs, docRoomCreateHost())
+	if c := checkFlagParse(fs, fs.Parse(args), "host"); c != 0 {
+		return c
 	}
-	if *direct {
-		*mode = "direct"
+	if *f.Direct {
+		*f.Mode = "direct"
 	}
-	pw := mergePass(*password, *pass)
-	applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
-	return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
+	pw := mergePass(*f.Password, *f.Pass)
+	applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit})
+	return execRoomCreate(*f.Name, *f.Mode, *f.Relay, *f.Direct, *f.Listen, *f.Public, pw)
 }
 
 func runJoinShortcut(args []string) int {
@@ -447,47 +470,38 @@ func runJoinShortcut(args []string) int {
 
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	name := fs.String("name", "guest", "Nombre")
-	codeFlag := fs.String("code", "", "Codigo de sala")
-	mode := fs.String("mode", "auto", "Modo")
-	relay := fs.String("relay", "", "Relay libp2p (p2p)")
-	direct := fs.Bool("direct", false, "Modo TCP directo")
-	password := fs.String("password", "", "Password")
-	pass := fs.String("pass", "", "Alias de --password")
-	notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
-	notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
-	fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
-	if err := fs.Parse(rest); err != nil {
-		return 1
+	jf := registerRoomJoinFlags(fs, docJoinShortcut())
+	if c := checkFlagParse(fs, fs.Parse(rest), "join"); c != 0 {
+		return c
 	}
-	if *direct {
-		*mode = "direct"
+	if *jf.Direct {
+		*jf.Mode = "direct"
 	}
-	if strings.TrimSpace(*codeFlag) != "" {
-		code = *codeFlag
+	if strings.TrimSpace(*jf.Code) != "" {
+		code = *jf.Code
 	}
-	if strings.TrimSpace(prof.Name) != "" && *name == "guest" {
-		*name = prof.Name
+	if strings.TrimSpace(prof.Name) != "" && *jf.Name == "guest" {
+		*jf.Name = prof.Name
 	}
-	if prof.Mode != "" && *mode == "auto" {
-		*mode = prof.Mode
+	if prof.Mode != "" && *jf.Mode == "auto" {
+		*jf.Mode = prof.Mode
 	}
-	relayVal := *relay
+	relayVal := *jf.Relay
 	if strings.TrimSpace(prof.Relay) != "" && relayVal == "" {
 		relayVal = prof.Relay
 	}
-	pw := mergePass(*password, *pass)
+	pw := mergePass(*jf.Password, *jf.Pass)
 	if strings.TrimSpace(prof.Password) != "" && pw == "" {
 		pw = prof.Password
 	}
-	if strings.TrimSpace(prof.NotifySound) != "" && *notifySound == "on" {
-		*notifySound = prof.NotifySound
+	if strings.TrimSpace(prof.NotifySound) != "" && *jf.NotifySound == "on" {
+		*jf.NotifySound = prof.NotifySound
 	}
-	if strings.TrimSpace(prof.NotifyLevel) != "" && *notifyLevel == "all" {
-		*notifyLevel = prof.NotifyLevel
+	if strings.TrimSpace(prof.NotifyLevel) != "" && *jf.NotifyLevel == "all" {
+		*jf.NotifyLevel = prof.NotifyLevel
 	}
-	if strings.TrimSpace(prof.FileLimit) != "" && *fileLimit == "10MB" {
-		*fileLimit = prof.FileLimit
+	if strings.TrimSpace(prof.FileLimit) != "" && *jf.FileLimit == "10MB" {
+		*jf.FileLimit = prof.FileLimit
 	}
 
 	if strings.TrimSpace(code) == "" {
@@ -499,8 +513,8 @@ func runJoinShortcut(args []string) int {
 		}
 	}
 
-	applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
-	return execRoomJoin(*name, code, *mode, relayVal, *direct, pw)
+	applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit})
+	return execRoomJoin(*jf.Name, code, *jf.Mode, relayVal, *jf.Direct, pw)
 }
 
 func runRoom(args []string) int {
@@ -516,26 +530,16 @@ func runRoom(args []string) int {
 		}
 		fs := flag.NewFlagSet("room create", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
-		name := fs.String("name", "host", "Nombre de usuario")
-		mode := fs.String("mode", "p2p", "Modo: p2p | direct | relay | guaranteed")
-		relay := fs.String("relay", "", "Multiaddr relay propio (opcional)")
-		direct := fs.Bool("direct", false, "Modo TCP directo (requiere IP publica)")
-		listen := fs.String("listen", "0.0.0.0:9090", "[--direct] Direccion local")
-		public := fs.String("public", "", "[--direct] Direccion publica host:puerto")
-		password := fs.String("password", "", "Password de la sala")
-		pass := fs.String("pass", "", "Alias de --password")
-		notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
-		notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
-		fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
-		if err := fs.Parse(args[1:]); err != nil {
-			return 1
+		f := registerRoomCreateFlags(fs, docRoomCreateCmd())
+		if c := checkFlagParse(fs, fs.Parse(args[1:]), "room create"); c != 0 {
+			return c
 		}
-		if *direct {
-			*mode = "direct"
+		if *f.Direct {
+			*f.Mode = "direct"
 		}
-		pw := mergePass(*password, *pass)
-		applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
-		return execRoomCreate(*name, *mode, *relay, *direct, *listen, *public, pw)
+		pw := mergePass(*f.Password, *f.Pass)
+		applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit})
+		return execRoomCreate(*f.Name, *f.Mode, *f.Relay, *f.Direct, *f.Listen, *f.Public, pw)
 
 	case "join":
 		if len(args) == 1 {
@@ -543,23 +547,14 @@ func runRoom(args []string) int {
 		}
 		fs := flag.NewFlagSet("room join", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
-		name := fs.String("name", "guest", "Nombre de usuario")
-		code := fs.String("code", "", "Codigo de la sala")
-		mode := fs.String("mode", "auto", "Modo: auto | p2p | direct | relay | guaranteed")
-		relay := fs.String("relay", "", "Multiaddr relay propio (opcional)")
-		direct := fs.Bool("direct", false, "Modo TCP directo")
-		password := fs.String("password", "", "Password de la sala")
-		pass := fs.String("pass", "", "Alias de --password")
-		notifySound := fs.String("notify-sound", "on", "Sonido: on | off")
-		notifyLevel := fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none")
-		fileLimit := fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)")
-		if err := fs.Parse(args[1:]); err != nil {
-			return 1
+		jf := registerRoomJoinFlags(fs, docRoomJoinCmd())
+		if c := checkFlagParse(fs, fs.Parse(args[1:]), "room join"); c != 0 {
+			return c
 		}
-		if *direct {
-			*mode = "direct"
+		if *jf.Direct {
+			*jf.Mode = "direct"
 		}
-		c := strings.TrimSpace(*code)
+		c := strings.TrimSpace(*jf.Code)
 		if c == "" {
 			var err error
 			c, err = readLineTrim("Codigo de sala: ")
@@ -568,9 +563,9 @@ func runRoom(args []string) int {
 				return 1
 			}
 		}
-		pw := mergePass(*password, *pass)
-		applyRuntimeOptions(runtimeOptions{NotifySound: *notifySound, NotifyLevel: *notifyLevel, FileLimit: *fileLimit})
-		return execRoomJoin(*name, c, *mode, *relay, *direct, pw)
+		pw := mergePass(*jf.Password, *jf.Pass)
+		applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit})
+		return execRoomJoin(*jf.Name, c, *jf.Mode, *jf.Relay, *jf.Direct, pw)
 
 	case "code":
 		code, err := p2pcmd.LoadLastCode()
@@ -612,8 +607,8 @@ func runRelay(args []string) int {
 	fs.SetOutput(os.Stderr)
 	listen := fs.String("listen", "0.0.0.0:10000", "Direccion local del relay host:puerto")
 	public := fs.String("public", "", "Direccion publica del relay host:puerto")
-	if err := fs.Parse(serveArgs); err != nil {
-		return 1
+	if c := checkFlagParse(fs, fs.Parse(serveArgs), "relay"); c != 0 {
+		return c
 	}
 	return chat.RunRelayServer(*listen, *public)
 }
@@ -636,7 +631,7 @@ func runUpdate(args []string) int {
 		return 0
 	}
 	if args[0] == "check" {
-		latest, available, err := updater.Check(version)
+		latest, available, err := updater.Check(Version())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error verificando updates: %v\n", err)
 			return 1
@@ -645,11 +640,11 @@ func runUpdate(args []string) int {
 			fmt.Println("Sin actualizaciones disponibles.")
 			return 0
 		}
-		fmt.Printf("Nueva version disponible: %s (actual %s)\n", latest, version)
+		fmt.Printf("Nueva version disponible: %s (actual %s)\n", latest, Version())
 		return 0
 	}
 	if args[0] == "apply" {
-		if err := updater.Apply(version); err != nil {
+		if err := updater.Apply(Version()); err != nil {
 			fmt.Fprintf(os.Stderr, "Error aplicando update: %v\n", err)
 			return 1
 		}
