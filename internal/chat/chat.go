@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -63,6 +65,8 @@ var (
 	nickColorMu      sync.Mutex
 	nickColorByName  = map[string]string{}
 	nextNickColorIdx int
+	notifyMu         sync.Mutex
+	lastNotifyAt     time.Time
 )
 
 type roomCodePayload struct {
@@ -996,6 +1000,7 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 			ht.set(msg.Host)
 		}
 		t := time.Unix(msg.At, 0).Format("15:04:05")
+		playConsoleNotification()
 		fmt.Printf("[%s] %s\n", t, colorizeSystem("Nuevo host de la sala: "+strings.TrimSpace(msg.Host)))
 		return
 	}
@@ -1009,6 +1014,7 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 	toLabel := displayNick(msg.To, myNick, hostVal)
 	switch msg.Type {
 	case msgTypeWelcome:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 		if strings.TrimSpace(msg.Assigned) != "" {
 			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Tu nombre:"), msg.Assigned)
@@ -1020,24 +1026,32 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
 		}
 	case msgTypeSystem:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
 	case msgTypeError:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s\n", t, colorizeError(msg.Text))
 	case msgTypePeers:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
 	case msgTypeDiag:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s\n", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)
 	case msgTypeChat:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
 	case msgTypePrivate:
 		if myNick != "" && msg.To != myNick && msg.From != myNick {
 			return
 		}
+		playConsoleNotification()
 		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
 	case msgTypeReaction:
+		playConsoleNotification()
 		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
 	case msgTypeFile:
 		path, size, err := saveIncomingFile(msg)
+		playConsoleNotification()
 		if err != nil {
 			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
 		} else {
@@ -1097,6 +1111,45 @@ func shouldSkipOwnEcho(msg wireMessage, myNick string) bool {
 
 func clearConsole() {
 	fmt.Print("\033[2J\033[H")
+}
+
+func playConsoleNotification() {
+	// BEL is terminal-level and works cross-platform when audible bell is enabled.
+	_, _ = fmt.Fprint(os.Stderr, "\a")
+	playNativeNotification()
+}
+
+func playNativeNotification() {
+	notifyMu.Lock()
+	if !lastNotifyAt.IsZero() && time.Since(lastNotifyAt) < 250*time.Millisecond {
+		notifyMu.Unlock()
+		return
+	}
+	lastNotifyAt = time.Now()
+	notifyMu.Unlock()
+
+	switch runtime.GOOS {
+	case "windows":
+		if _, err := exec.LookPath("powershell"); err == nil {
+			_ = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "[console]::beep(1200,120)").Start()
+		}
+	case "darwin":
+		if _, err := exec.LookPath("afplay"); err == nil {
+			_ = exec.Command("afplay", "/System/Library/Sounds/Pop.aiff").Start()
+		}
+	case "linux":
+		if _, err := exec.LookPath("paplay"); err == nil {
+			_ = exec.Command("paplay", "/usr/share/sounds/freedesktop/stereo/message.oga").Start()
+			return
+		}
+		if _, err := exec.LookPath("canberra-gtk-play"); err == nil {
+			_ = exec.Command("canberra-gtk-play", "-i", "message").Start()
+			return
+		}
+		if _, err := exec.LookPath("aplay"); err == nil {
+			_ = exec.Command("aplay", "/usr/share/sounds/alsa/Front_Center.wav").Start()
+		}
+	}
 }
 
 func printRateLimitLocal() {
