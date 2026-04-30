@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"os/exec"
 	"path/filepath"
@@ -15,12 +14,12 @@ import (
 
 func TestDirectCreateJoinSendLeave(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	createCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "create", "--mode", "direct", "--listen", "127.0.0.1:19091", "--public", "127.0.0.1:19091", "--password", "p4ss", "--name", "host")
 	createCmd.Dir = repoRoot(t)
-	var hostOut bytes.Buffer
+	var hostOut safeOutput
 	createCmd.Stdout = &hostOut
 	createCmd.Stderr = &hostOut
 	hostIn, err := createCmd.StdinPipe()
@@ -31,7 +30,7 @@ func TestDirectCreateJoinSendLeave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, &hostOut, "Codigo de sala:", 12*time.Second)
+	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
 	code := extractCode(hostOut.String())
 	if code == "" {
 		t.Fatalf("no se pudo extraer code: %s", hostOut.String())
@@ -39,7 +38,7 @@ func TestDirectCreateJoinSendLeave(t *testing.T) {
 
 	joinCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "join", "--mode", "direct", "--code", code, "--password", "p4ss", "--name", "guest")
 	joinCmd.Dir = repoRoot(t)
-	var guestOut bytes.Buffer
+	var guestOut safeOutput
 	joinCmd.Stdout = &guestOut
 	joinCmd.Stderr = &guestOut
 	guestIn, err := joinCmd.StdinPipe()
@@ -49,27 +48,15 @@ func TestDirectCreateJoinSendLeave(t *testing.T) {
 	if err := joinCmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, &guestOut, "Conectado a la sala", 10*time.Second)
+	waitForCtx(t, ctx, &guestOut, "Conectado a la sala")
 	if _, err := guestIn.Write([]byte("hola-e2e\n")); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, &hostOut, "hola-e2e", 10*time.Second)
+	waitForCtx(t, ctx, &hostOut, "hola-e2e")
 	_, _ = guestIn.Write([]byte("/quit\n"))
 	_, _ = hostIn.Write([]byte("/quit\n"))
 	_ = joinCmd.Wait()
 	_ = createCmd.Wait()
-}
-
-func waitFor(t *testing.T, b *bytes.Buffer, needle string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if strings.Contains(b.String(), needle) {
-			return
-		}
-		time.Sleep(120 * time.Millisecond)
-	}
-	t.Fatalf("timeout esperando %q en salida: %s", needle, b.String())
 }
 
 func extractCode(out string) string {

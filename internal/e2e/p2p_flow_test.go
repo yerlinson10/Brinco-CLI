@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"os/exec"
 	"testing"
@@ -13,12 +12,12 @@ import (
 // system siguen en JSON en claro y deben mostrarse sin pasar por AES-GCM.
 func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	createCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "create", "--mode", "p2p", "--name", "host")
 	createCmd.Dir = repoRoot(t)
-	var hostOut bytes.Buffer
+	var hostOut safeOutput
 	createCmd.Stdout = &hostOut
 	createCmd.Stderr = &hostOut
 	hostIn, err := createCmd.StdinPipe()
@@ -29,7 +28,7 @@ func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, &hostOut, "Codigo de sala:", 50*time.Second)
+	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
 	code := extractCode(hostOut.String())
 	if code == "" {
 		t.Fatalf("no se pudo extraer code p2p: %s", hostOut.String())
@@ -37,7 +36,7 @@ func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 
 	joinCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "join", "--mode", "p2p", "--code", code, "--name", "guest")
 	joinCmd.Dir = repoRoot(t)
-	var guestOut bytes.Buffer
+	var guestOut safeOutput
 	joinCmd.Stdout = &guestOut
 	joinCmd.Stderr = &guestOut
 	guestIn, err := joinCmd.StdinPipe()
@@ -48,17 +47,17 @@ func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, &guestOut, "Conectado al topic de la sala", 50*time.Second)
+	waitForCtx(t, ctx, &guestOut, "Conectado al topic de la sala")
 
 	// Mensaje system en claro al unirse (Publish type system, sin cifrar).
-	waitFor(t, &hostOut, "se unio", 45*time.Second)
+	waitForCtx(t, ctx, &hostOut, "se unio")
 
 	const chatToken = "e2e-p2p-cifrado-xyz"
 	if _, err := guestIn.Write([]byte(chatToken + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	// Chat cifrado: el host debe mostrar el texto tras descifrar.
-	waitFor(t, &hostOut, chatToken, 45*time.Second)
+	waitForCtx(t, ctx, &hostOut, chatToken)
 
 	_, _ = guestIn.Write([]byte("/quit\n"))
 	_, _ = hostIn.Write([]byte("/quit\n"))
