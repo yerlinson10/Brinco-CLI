@@ -380,12 +380,10 @@ func (r *relayRoom) broadcast(msg wireMessage, except *serverClient) {
 func (r *relayRoom) sendPrivate(from *serverClient, toName, text string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var to *serverClient
-	for c := range r.clients {
-		if c.name == strings.TrimSpace(toName) {
-			to = c
-			break
-		}
+	to, amb := findClientInSet(r.clients, toName)
+	if amb {
+		enqueueClientWire(from, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "private")
+		return
 	}
 	if to == nil {
 		enqueueClientWire(from, wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}, "private")
@@ -410,16 +408,10 @@ func (r *relayRoom) isBannedName(name string) bool {
 	return r.banned[normalizeNickKey(name)]
 }
 
-func (r *relayRoom) findClientByName(name string) *serverClient {
+func (r *relayRoom) findClientByName(name string) (match *serverClient, ambiguous bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	target := strings.TrimSpace(name)
-	for c := range r.clients {
-		if c.name == target {
-			return c
-		}
-	}
-	return nil
+	return findClientInSet(r.clients, name)
 }
 
 func (r *relayRoom) handleModerationCommand(sender *serverClient, line string) {
@@ -432,7 +424,7 @@ func (r *relayRoom) handleModerationCommand(sender *serverClient, line string) {
 		enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "uso: /kick|/mute|/unmute|/ban <usuario>", At: time.Now().Unix()}, "mod")
 		return
 	}
-	target := r.findClientByName(user)
+	target, amb := r.findClientByName(user)
 	switch cmd {
 	case "/mute":
 		r.mu.Lock()
@@ -451,6 +443,10 @@ func (r *relayRoom) handleModerationCommand(sender *serverClient, line string) {
 		}
 		r.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s ya puede escribir", user), At: time.Now().Unix()}, nil)
 	case "/kick":
+		if amb {
+			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "mod")
+			return
+		}
 		if target == nil {
 			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "usuario no encontrado", At: time.Now().Unix()}, "mod")
 			return
@@ -458,6 +454,10 @@ func (r *relayRoom) handleModerationCommand(sender *serverClient, line string) {
 		enqueueClientWire(target, wireMessage{Type: msgTypeError, Text: "expulsado por el host", At: time.Now().Unix()}, "kick")
 		_ = target.conn.Close()
 	case "/ban":
+		if amb {
+			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "mod")
+			return
+		}
 		r.mu.Lock()
 		r.banned[normalizeNickKey(user)] = true
 		delete(r.muted, normalizeNickKey(user))
@@ -504,11 +504,18 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, scannerTokenInitial), scannerTokenMax)
+		decodeFails := 0
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
+				decodeFails++
+				if decodeFails >= maxDecodeFailures {
+					logx.Warn("relay client decode failures closing", "remote", conn.RemoteAddr().String())
+					return
+				}
 				continue
 			}
+			decodeFails = 0
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
 				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)

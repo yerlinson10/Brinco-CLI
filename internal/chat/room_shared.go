@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"brinco-cli/internal/logx"
@@ -21,7 +22,38 @@ const (
 	uniqueNameMaxNumeric = 10000
 	acceptErrBackoff     = 200 * time.Millisecond
 	stdinLineChanCap     = 128
+
+	// Tiempo sin nuevos chunks antes de descartar un transfer incompleto.
+	incomingFileTransferTTL = 15 * time.Minute
 )
+
+// findClientInSet resuelve nick exacto; si no hay coincidencia exacta, prueba
+// coincidencia sin distinguir mayúsculas. Si hay más de un cliente en sala
+// que coincide (p. ej. "bob" y "Bob"), devuelve ambiguous=true.
+func findClientInSet(clients map[*serverClient]struct{}, name string) (match *serverClient, ambiguous bool) {
+	target := strings.TrimSpace(name)
+	if target == "" {
+		return nil, false
+	}
+	for c := range clients {
+		if c.name == target {
+			return c, false
+		}
+	}
+	var fold []*serverClient
+	for c := range clients {
+		if strings.EqualFold(c.name, target) {
+			fold = append(fold, c)
+		}
+	}
+	if len(fold) == 0 {
+		return nil, false
+	}
+	if len(fold) > 1 {
+		return nil, true
+	}
+	return fold[0], false
+}
 
 func pickSuccessorHost(clients map[*serverClient]struct{}) *serverClient {
 	var best *serverClient

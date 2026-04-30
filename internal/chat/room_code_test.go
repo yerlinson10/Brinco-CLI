@@ -95,6 +95,9 @@ func TestBuildFileChunksMetadata(t *testing.T) {
 	if total != 22 || checksum == "" || name != "demo.txt" || len(chunks) != 1 {
 		t.Fatalf("unexpected chunks: total=%d checksum=%q name=%q len=%d", total, checksum, name, len(chunks))
 	}
+	if tid := chunks[0].TransferID; len(tid) < 32 || tid == checksum[:16] {
+		t.Fatalf("transferId should be nonce+hash prefix, got len=%d tid=%q", len(tid), tid)
+	}
 	if !validFileChunk(chunks[0]) {
 		t.Fatalf("chunk should be valid: %#v", chunks[0])
 	}

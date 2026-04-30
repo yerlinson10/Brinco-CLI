@@ -114,6 +114,8 @@ type incomingFileTransfer struct {
 	got         []bool
 	received    int
 	lastPercent int
+	cleanup     *time.Timer
+	ttlBump     uint64
 }
 
 func SetMaxFileBytes(limit int64) {
@@ -576,6 +578,8 @@ func (s *roomServer) handleClientMessage(c *serverClient, msg wireMessage) {
 	}
 }
 
+// allowMessage solo debe llamarse desde la goroutine de handleConn de este
+// cliente (una lectura por conexión); no es seguro en concurrencia cruzada.
 func (c *serverClient) allowMessage() bool {
 	const maxTok = 5.0
 	const refillPerSec = 2.0
@@ -639,12 +643,10 @@ func (s *roomServer) broadcast(msg wireMessage, except *serverClient) {
 func (s *roomServer) sendPrivate(from *serverClient, toName, text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var to *serverClient
-	for c := range s.clients {
-		if c.name == strings.TrimSpace(toName) {
-			to = c
-			break
-		}
+	to, amb := findClientInSet(s.clients, toName)
+	if amb {
+		enqueueClientWire(from, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "private")
+		return
 	}
 	if to == nil {
 		enqueueClientWire(from, wireMessage{Type: msgTypeError, Text: fmt.Sprintf("usuario %q no encontrado", toName), At: time.Now().Unix()}, "private")
@@ -669,16 +671,10 @@ func (s *roomServer) isBannedName(name string) bool {
 	return s.banned[normalizeNickKey(name)]
 }
 
-func (s *roomServer) findClientByName(name string) *serverClient {
+func (s *roomServer) findClientByName(name string) (match *serverClient, ambiguous bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	target := strings.TrimSpace(name)
-	for c := range s.clients {
-		if c.name == target {
-			return c
-		}
-	}
-	return nil
+	return findClientInSet(s.clients, name)
 }
 
 func (s *roomServer) handleModerationCommand(sender *serverClient, line string) {
@@ -691,7 +687,7 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "uso: /kick|/mute|/unmute|/ban <usuario>", At: time.Now().Unix()}, "mod")
 		return
 	}
-	target := s.findClientByName(user)
+	target, amb := s.findClientByName(user)
 	switch cmd {
 	case "/mute":
 		s.mu.Lock()
@@ -710,6 +706,10 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		}
 		s.broadcast(wireMessage{Type: msgTypeSystem, Text: fmt.Sprintf("%s ya puede escribir", user), At: time.Now().Unix()}, nil)
 	case "/kick":
+		if amb {
+			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "mod")
+			return
+		}
 		if target == nil {
 			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "usuario no encontrado", At: time.Now().Unix()}, "mod")
 			return
@@ -717,6 +717,10 @@ func (s *roomServer) handleModerationCommand(sender *serverClient, line string) 
 		enqueueClientWire(target, wireMessage{Type: msgTypeError, Text: "expulsado por el host", At: time.Now().Unix()}, "kick")
 		_ = target.conn.Close()
 	case "/ban":
+		if amb {
+			enqueueClientWire(sender, wireMessage{Type: msgTypeError, Text: "varios usuarios coinciden con ese nick; usa el nombre exacto", At: time.Now().Unix()}, "mod")
+			return
+		}
 		s.mu.Lock()
 		s.banned[normalizeNickKey(user)] = true
 		delete(s.muted, normalizeNickKey(user))
@@ -805,11 +809,18 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 		defer close(done)
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 0, scannerTokenInitial), scannerTokenMax)
+		decodeFails := 0
 		for scanner.Scan() {
 			msg, err := decodeMessage(scanner.Text())
 			if err != nil {
+				decodeFails++
+				if decodeFails >= maxDecodeFailures {
+					logx.Warn("chat client decode failures closing", "remote", conn.RemoteAddr().String())
+					return
+				}
 				continue
 			}
+			decodeFails = 0
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Assigned) != "" {
 				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)
@@ -1415,7 +1426,11 @@ func buildFileChunks(path string) ([]wireMessage, int64, string, string, error) 
 	const chunkSize = 64 * 1024
 	sum := sha256.Sum256(raw)
 	checksum := hex.EncodeToString(sum[:])
-	transferID := checksum[:16]
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, 0, "", "", err
+	}
+	transferID := hex.EncodeToString(nonce[:]) + checksum[:16]
 	chunkCount := int((total + chunkSize - 1) / chunkSize)
 	if chunkCount == 0 {
 		chunkCount = 1
@@ -1455,6 +1470,42 @@ type fileChunkResult struct {
 	Err     error
 }
 
+func rescheduleIncomingFileTTL(transferID string, tr *incomingFileTransfer) {
+	tr.ttlBump++
+	b := tr.ttlBump
+	ptr := tr
+	if tr.cleanup != nil {
+		if !tr.cleanup.Stop() {
+			select {
+			case <-tr.cleanup.C:
+			default:
+			}
+		}
+	}
+	tr.cleanup = time.AfterFunc(incomingFileTransferTTL, func() {
+		incomingFileMu.Lock()
+		defer incomingFileMu.Unlock()
+		cur, ok := incomingFiles[transferID]
+		if !ok || cur != ptr || cur.ttlBump != b {
+			return
+		}
+		delete(incomingFiles, transferID)
+	})
+}
+
+func stopIncomingFileTTL(tr *incomingFileTransfer) {
+	if tr == nil || tr.cleanup == nil {
+		return
+	}
+	if !tr.cleanup.Stop() {
+		select {
+		case <-tr.cleanup.C:
+		default:
+		}
+	}
+	tr.cleanup = nil
+}
+
 func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 	if !validFileChunk(msg) {
 		return fileChunkResult{Err: fmt.Errorf("chunk invalido")}
@@ -1478,6 +1529,8 @@ func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 		incomingFiles[msg.TransferID] = tr
 	}
 	if msg.ChunkIndex >= len(tr.chunks) {
+		stopIncomingFileTTL(tr)
+		delete(incomingFiles, msg.TransferID)
 		return fileChunkResult{Err: fmt.Errorf("chunk fuera de rango")}
 	}
 	if !tr.got[msg.ChunkIndex] {
@@ -1485,6 +1538,7 @@ func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 		tr.chunks[msg.ChunkIndex] = raw
 		tr.received++
 	}
+	rescheduleIncomingFileTTL(msg.TransferID, tr)
 	percent := (tr.received * 100) / len(tr.chunks)
 	if tr.received < len(tr.chunks) {
 		if percent >= tr.lastPercent+10 || percent == 100 {
@@ -1499,22 +1553,30 @@ func saveIncomingFileChunk(msg wireMessage) fileChunkResult {
 		assembled = append(assembled, chunk...)
 	}
 	if int64(len(assembled)) != tr.totalSize {
+		stopIncomingFileTTL(tr)
+		delete(incomingFiles, msg.TransferID)
 		return fileChunkResult{Err: fmt.Errorf("tamano recibido invalido")}
 	}
 	sum := sha256.Sum256(assembled)
 	if hex.EncodeToString(sum[:]) != tr.checksum {
+		stopIncomingFileTTL(tr)
+		delete(incomingFiles, msg.TransferID)
 		return fileChunkResult{Err: fmt.Errorf("checksum invalido")}
 	}
 	path, err := writeIncomingFile(tr.name, assembled)
 	if err != nil {
+		stopIncomingFileTTL(tr)
+		delete(incomingFiles, msg.TransferID)
 		return fileChunkResult{Err: err}
 	}
+	stopIncomingFileTTL(tr)
 	delete(incomingFiles, msg.TransferID)
 	return fileChunkResult{Path: path, Size: len(assembled), Percent: 100, Done: true}
 }
 
 func validFileChunk(msg wireMessage) bool {
-	return strings.TrimSpace(msg.TransferID) != "" &&
+	tid := strings.TrimSpace(msg.TransferID)
+	return tid != "" && len(tid) <= 96 &&
 		strings.TrimSpace(msg.FileName) != "" &&
 		msg.ChunkCount > 0 &&
 		msg.ChunkIndex >= 0 &&
