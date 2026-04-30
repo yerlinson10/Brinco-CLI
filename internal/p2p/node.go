@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,6 +57,11 @@ type encryptedMessage struct {
 	Nonce  string `json:"nonce"`
 	Cipher string `json:"cipher"`
 }
+
+// errNotEncryptedEnvelope indica que el JSON no es un sobre {"nonce","cipher"}
+// valido para AES-GCM (p.ej. mensaje system en claro). receiveLoop puede hacer
+// fallback a json.Unmarshal directo al chatMessage solo en ese caso.
+var errNotEncryptedEnvelope = errors.New("payload no es sobre cifrado brinco")
 
 type roomCodePayload struct {
 	Topic string   `json:"topic"`
@@ -621,11 +627,18 @@ func (n *Node) receiveLoop() {
 		// como chatMessage el unmarshal no falla (campos ignorados) y nunca se descifra.
 		// Hay que intentar descifrado antes que JSON en claro.
 		var cm chatMessage
-		if plain, derr := n.decryptPayload(msg.Data); derr == nil {
+		plain, derr := n.decryptPayload(msg.Data)
+		switch {
+		case derr == nil:
 			if err := json.Unmarshal(plain, &cm); err != nil {
 				continue
 			}
-		} else if err := json.Unmarshal(msg.Data, &cm); err != nil {
+		case errors.Is(derr, errNotEncryptedEnvelope):
+			if err := json.Unmarshal(msg.Data, &cm); err != nil {
+				continue
+			}
+		default:
+			logx.Debug("mensaje p2p descartado (descifrado)", "err", derr)
 			continue
 		}
 		if cm.From != "" && !n.allowPeer(cm.From) {
@@ -670,15 +683,23 @@ func (n *Node) encryptPayload(plain []byte) ([]byte, error) {
 func (n *Node) decryptPayload(raw []byte) ([]byte, error) {
 	var env encryptedMessage
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errNotEncryptedEnvelope, err)
 	}
-	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
-	if err != nil {
-		return nil, err
+	nNonce := strings.TrimSpace(env.Nonce)
+	nCipher := strings.TrimSpace(env.Cipher)
+	if nNonce == "" && nCipher == "" {
+		return nil, errNotEncryptedEnvelope
 	}
-	cipherText, err := base64.StdEncoding.DecodeString(env.Cipher)
+	if nNonce == "" || nCipher == "" {
+		return nil, fmt.Errorf("sobre cifrado incompleto (nonce/cipher)")
+	}
+	nonce, err := base64.StdEncoding.DecodeString(nNonce)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("nonce base64: %w", err)
+	}
+	cipherText, err := base64.StdEncoding.DecodeString(nCipher)
+	if err != nil {
+		return nil, fmt.Errorf("cipher base64: %w", err)
 	}
 	block, err := aes.NewCipher(n.roomSecret[:])
 	if err != nil {
@@ -688,7 +709,14 @@ func (n *Node) decryptPayload(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Open(nil, nonce, cipherText, nil)
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("tamano nonce invalido: %d (esperado %d)", len(nonce), gcm.NonceSize())
+	}
+	plain, err := gcm.Open(nil, nonce, cipherText, nil)
+	if err != nil {
+		return nil, fmt.Errorf("aes-gcm open: %w", err)
+	}
+	return plain, nil
 }
 
 func (n *Node) markSeen(id string) bool {
