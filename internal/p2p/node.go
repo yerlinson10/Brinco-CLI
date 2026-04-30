@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -47,10 +48,12 @@ var defaultBootstrapPeers = []string{
 type chatMessage struct {
 	ID          string `json:"id,omitempty"`
 	From        string `json:"from"`
+	FromPeer    string `json:"fromPeer,omitempty"`
 	Text        string `json:"text"`
 	Type        string `json:"type"` // chat | system | private | reaction | file
 	At          int64  `json:"at"`
 	To          string `json:"to,omitempty"`
+	ToPeer      string `json:"toPeer,omitempty"`
 	FileName    string `json:"fileName,omitempty"`
 	FilePayload string `json:"filePayload,omitempty"`
 	TransferID  string `json:"transferId,omitempty"`
@@ -60,6 +63,9 @@ type chatMessage struct {
 	TotalSize   int64  `json:"totalSize,omitempty"`
 	Checksum    string `json:"checksum,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
+	PubKey      string `json:"pubKey,omitempty"`
+	DMNonce     string `json:"dmNonce,omitempty"`
+	DMCipher    string `json:"dmCipher,omitempty"`
 }
 
 type encryptedMessage struct {
@@ -98,8 +104,13 @@ type Node struct {
 	lastConnectivity time.Time
 	peerFingerprints map[string]string
 	rate             map[string]*peerRate
+	peerNameByID     map[string]string
+	peerIDByName     map[string]string
+	peerPubByID      map[string]string
 	roomCode         string
 	roomSecret       [32]byte
+	dmPriv           *ecdh.PrivateKey
+	dmPubB64         string
 }
 
 var (
@@ -128,6 +139,7 @@ type incomingP2PFileTransfer struct {
 	got         []bool
 	received    int
 	lastPercent int
+	updatedAt   time.Time
 }
 
 func SetMaxFileBytes(limit int64) {
@@ -222,8 +234,26 @@ func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, er
 		cancel()
 		return nil, fmt.Errorf("error creando pubsub: %w", err)
 	}
-
-	n := &Node{host: h, ps: ps, ctx: retx, cancel: cancel, seenMsgs: make(map[string]time.Time), peerFingerprints: make(map[string]string), rate: make(map[string]*peerRate)}
+	dmPriv, dmPubB64, err := generateDMKeys()
+	if err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, fmt.Errorf("error creando claves privadas: %w", err)
+	}
+	n := &Node{
+		host:             h,
+		ps:               ps,
+		ctx:              retx,
+		cancel:           cancel,
+		seenMsgs:         make(map[string]time.Time),
+		peerFingerprints: make(map[string]string),
+		rate:             make(map[string]*peerRate),
+		peerNameByID:     make(map[string]string),
+		peerIDByName:     make(map[string]string),
+		peerPubByID:      make(map[string]string),
+		dmPriv:           dmPriv,
+		dmPubB64:         dmPubB64,
+	}
 	n.setConnectivity("connected")
 	return n, nil
 }
@@ -266,8 +296,26 @@ func NewNode(ctx context.Context, relayAddrs []string) (*Node, error) {
 		cancel()
 		return nil, fmt.Errorf("error creando pubsub: %w", err)
 	}
-
-	n := &Node{host: h, ps: ps, ctx: ctx, cancel: cancel, seenMsgs: make(map[string]time.Time), peerFingerprints: make(map[string]string), rate: make(map[string]*peerRate)}
+	dmPriv, dmPubB64, err := generateDMKeys()
+	if err != nil {
+		_ = h.Close()
+		cancel()
+		return nil, fmt.Errorf("error creando claves privadas: %w", err)
+	}
+	n := &Node{
+		host:             h,
+		ps:               ps,
+		ctx:              ctx,
+		cancel:           cancel,
+		seenMsgs:         make(map[string]time.Time),
+		peerFingerprints: make(map[string]string),
+		rate:             make(map[string]*peerRate),
+		peerNameByID:     make(map[string]string),
+		peerIDByName:     make(map[string]string),
+		peerPubByID:      make(map[string]string),
+		dmPriv:           dmPriv,
+		dmPubB64:         dmPubB64,
+	}
 	n.setConnectivity("connected")
 	return n, nil
 }
@@ -361,6 +409,11 @@ func (n *Node) Publish(text string, msgType string) error {
 }
 
 func (n *Node) publishMessage(msg chatMessage) error {
+	if n.topic == nil {
+		return fmt.Errorf("topic no inicializado, ejecuta JoinTopic primero")
+	}
+	msg.FromPeer = n.host.ID().String()
+	msg.PubKey = n.dmPubB64
 	rawPlain, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -518,6 +571,7 @@ func RandomTopic() (string, error) {
 func (n *Node) RunChat(roomCode string) int {
 	n.SetRoomCode(roomCode)
 	go n.reconnectLoop()
+	go n.cleanupIncomingTransfersLoop()
 	go n.receiveLoop()
 
 	fmt.Println("Conectado al topic de la sala")
@@ -560,7 +614,7 @@ func (n *Node) RunChat(roomCode string) int {
 				printRateLimitLocalP2P()
 				continue
 			}
-			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint(n.host.ID().String())}
 			if err := n.publishMessage(reactionMsg); err != nil {
 				fmt.Fprintf(os.Stderr, "Error enviando reaccion: %v\n", err)
 			} else {
@@ -574,11 +628,17 @@ func (n *Node) RunChat(roomCode string) int {
 				printRateLimitLocalP2P()
 				continue
 			}
-			pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: txt, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+			pmMsg, err := n.newPrivateMessage(to, txt)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error preparando privado: %v\n", err)
+				continue
+			}
 			if err := n.publishMessage(pmMsg); err != nil {
 				fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
 			} else {
-				renderMessage(pmMsg, n.name)
+				localPM := pmMsg
+				localPM.Text = txt
+				renderMessage(localPM, n.name)
 			}
 			continue
 		}
@@ -610,11 +670,17 @@ func (n *Node) RunChat(roomCode string) int {
 					printRateLimitLocalP2P()
 					continue
 				}
-				pmMsg := chatMessage{ID: newMessageID(), From: n.name, To: to, Text: text, Type: "private", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+				pmMsg, err := n.newPrivateMessage(to, text)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error preparando privado: %v\n", err)
+					continue
+				}
 				if err := n.publishMessage(pmMsg); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando privado: %v\n", err)
 				} else {
-					renderMessage(pmMsg, n.name)
+					localPM := pmMsg
+					localPM.Text = text
+					renderMessage(localPM, n.name)
 				}
 			case strings.HasPrefix(line, "/send "):
 				if !allowLocalP2P(localLimiter) {
@@ -643,7 +709,7 @@ func (n *Node) RunChat(roomCode string) int {
 }
 
 func (n *Node) publishChatReliable(text string) error {
-	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix(), Fingerprint: n.fingerprint()}
+	msg := chatMessage{ID: newMessageID(), From: n.name, Text: text, Type: "chat", At: time.Now().Unix(), Fingerprint: n.fingerprint(n.host.ID().String())}
 	var lastErr error
 	for i := 0; i < 80; i++ {
 		if n.TopicPeerCount() == 0 && len(n.roomPeers) > 0 {
@@ -667,6 +733,9 @@ func (n *Node) publishChatReliable(text string) error {
 }
 
 func (n *Node) receiveLoop() {
+	if n.sub == nil {
+		return
+	}
 	for {
 		msg, err := n.sub.Next(n.ctx)
 		if err != nil {
@@ -695,17 +764,36 @@ func (n *Node) receiveLoop() {
 			logx.Debug("mensaje p2p descartado (descifrado)", "err", derr)
 			continue
 		}
-		if cm.From != "" && !n.allowPeer(cm.From) {
+		senderPeerID := strings.TrimSpace(msg.GetFrom().String())
+		if senderPeerID == "" {
 			continue
 		}
-		if cm.Fingerprint != "" && !n.trackFingerprint(cm.From, cm.Fingerprint) {
+		if !n.bindPeerIdentity(senderPeerID, cm.From) {
+			fmt.Printf("[seguridad] alias '%s' en conflicto, posible suplantacion\n", strings.TrimSpace(cm.From))
+			continue
+		}
+		n.trackPeerPubKey(senderPeerID, cm.PubKey)
+		if !n.allowPeer(senderPeerID) {
+			continue
+		}
+		if cm.Fingerprint != "" && !n.trackFingerprint(senderPeerID, cm.Fingerprint) {
 			fmt.Printf("[seguridad] fingerprint cambio para %s, posible suplantacion\n", cm.From)
 			continue
 		}
 		if !n.markSeen(cm.ID) {
 			continue
 		}
-		if cm.To != "" && cm.To != n.name && cm.From != n.name {
+		if cm.Type == "private" {
+			plain, err := n.decryptPrivatePayload(senderPeerID, cm)
+			if err != nil {
+				continue
+			}
+			cm.Text = plain
+		}
+		if cm.ToPeer != "" && cm.ToPeer != n.host.ID().String() && senderPeerID != n.host.ID().String() {
+			continue
+		}
+		if cm.To != "" && cm.To != n.name && senderPeerID != n.host.ID().String() {
 			continue
 		}
 		n.setConnectivity("connected")
@@ -896,6 +984,10 @@ func (n *Node) connectivityState() string {
 }
 
 func (n *Node) printDiag() {
+	if n.topic == nil {
+		fmt.Printf("Estado: %s\nPeers topic: 0\nRelay activo: no\nNAT: desconocido\n", n.connectivityState())
+		return
+	}
 	relay := "no"
 	for _, addr := range n.host.Addrs() {
 		if strings.Contains(addr.String(), "p2p-circuit") {
@@ -921,13 +1013,13 @@ func (n *Node) printDiag() {
 	}
 }
 
-func (n *Node) fingerprint() string {
-	sum := sha256.Sum256([]byte(n.host.ID().String()))
+func (n *Node) fingerprint(peerID string) string {
+	sum := sha256.Sum256([]byte(peerID))
 	return hex.EncodeToString(sum[:8])
 }
 
 func (n *Node) trackFingerprint(name, fp string) bool {
-	if strings.TrimSpace(name) == "" {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(fp) == "" {
 		return true
 	}
 	n.statusMu.Lock()
@@ -1096,7 +1188,7 @@ func (n *Node) sendFile(path string) error {
 			ChunkSize:   chunkSize,
 			TotalSize:   int64(len(raw)),
 			Checksum:    checksum,
-			Fingerprint: n.fingerprint(),
+			Fingerprint: n.fingerprint(n.host.ID().String()),
 		}
 		if err := n.publishMessage(msg); err != nil {
 			return err
@@ -1148,9 +1240,11 @@ func saveIncomingP2PFileChunk(msg chatMessage) p2pFileChunkResult {
 			totalSize: msg.TotalSize,
 			chunks:    make([][]byte, msg.ChunkCount),
 			got:       make([]bool, msg.ChunkCount),
+			updatedAt: time.Now(),
 		}
 		incomingP2PFiles[msg.TransferID] = tr
 	}
+	tr.updatedAt = time.Now()
 	if msg.ChunkIndex >= len(tr.chunks) {
 		return p2pFileChunkResult{Err: fmt.Errorf("chunk fuera de rango")}
 	}
@@ -1420,4 +1514,189 @@ func newMessageID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+func generateDMKeys() (*ecdh.PrivateKey, string, error) {
+	curve := ecdh.X25519()
+	priv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", err
+	}
+	return priv, base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()), nil
+}
+
+func (n *Node) bindPeerIdentity(peerID, alias string) bool {
+	peerID = strings.TrimSpace(peerID)
+	alias = strings.TrimSpace(alias)
+	if peerID == "" {
+		return false
+	}
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
+	if prevAlias, ok := n.peerNameByID[peerID]; ok && alias != "" && prevAlias != alias {
+		return false
+	}
+	if alias != "" {
+		if prevID, ok := n.peerIDByName[alias]; ok && prevID != peerID {
+			return false
+		}
+		n.peerIDByName[alias] = peerID
+		n.peerNameByID[peerID] = alias
+	}
+	return true
+}
+
+func (n *Node) trackPeerPubKey(peerID, pubKey string) {
+	peerID = strings.TrimSpace(peerID)
+	pubKey = strings.TrimSpace(pubKey)
+	if peerID == "" || pubKey == "" {
+		return
+	}
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
+	if _, ok := n.peerPubByID[peerID]; !ok {
+		n.peerPubByID[peerID] = pubKey
+	}
+}
+
+func (n *Node) lookupPeerByAlias(alias string) (string, string, bool) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return "", "", false
+	}
+	n.statusMu.RLock()
+	defer n.statusMu.RUnlock()
+	peerID := n.peerIDByName[alias]
+	pubKey := n.peerPubByID[peerID]
+	if peerID == "" || pubKey == "" {
+		return "", "", false
+	}
+	return peerID, pubKey, true
+}
+
+func (n *Node) newPrivateMessage(toAlias, text string) (chatMessage, error) {
+	toPeerID, toPub, ok := n.lookupPeerByAlias(toAlias)
+	if !ok {
+		return chatMessage{}, fmt.Errorf("usuario '%s' no descubierto aun; espera su primer mensaje en sala", toAlias)
+	}
+	nonceB64, cipherB64, err := n.encryptPrivatePayload(toPub, text)
+	if err != nil {
+		return chatMessage{}, err
+	}
+	return chatMessage{
+		ID:          newMessageID(),
+		From:        n.name,
+		To:          toAlias,
+		ToPeer:      toPeerID,
+		Type:        "private",
+		At:          time.Now().Unix(),
+		Fingerprint: n.fingerprint(n.host.ID().String()),
+		DMNonce:     nonceB64,
+		DMCipher:    cipherB64,
+	}, nil
+}
+
+func (n *Node) encryptPrivatePayload(peerPubB64, text string) (string, string, error) {
+	peerPubRaw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(peerPubB64))
+	if err != nil {
+		return "", "", fmt.Errorf("clave publica destinatario invalida: %w", err)
+	}
+	curve := ecdh.X25519()
+	peerPub, err := curve.NewPublicKey(peerPubRaw)
+	if err != nil {
+		return "", "", fmt.Errorf("clave publica destinatario invalida: %w", err)
+	}
+	secret, err := n.dmPriv.ECDH(peerPub)
+	if err != nil {
+		return "", "", fmt.Errorf("no se pudo derivar secreto privado: %w", err)
+	}
+	key := sha256.Sum256(secret)
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(text), nil)
+	return base64.StdEncoding.EncodeToString(nonce), base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+func (n *Node) decryptPrivatePayload(senderPeerID string, msg chatMessage) (string, error) {
+	if strings.TrimSpace(msg.DMNonce) == "" || strings.TrimSpace(msg.DMCipher) == "" {
+		return "", fmt.Errorf("mensaje privado sin payload cifrado")
+	}
+	if strings.TrimSpace(msg.ToPeer) != "" && strings.TrimSpace(msg.ToPeer) != n.host.ID().String() {
+		return "", fmt.Errorf("mensaje privado no dirigido a este nodo")
+	}
+	n.statusMu.RLock()
+	senderPubB64 := n.peerPubByID[senderPeerID]
+	n.statusMu.RUnlock()
+	if strings.TrimSpace(senderPubB64) == "" {
+		return "", fmt.Errorf("clave publica remitente desconocida")
+	}
+	senderPubRaw, err := base64.StdEncoding.DecodeString(senderPubB64)
+	if err != nil {
+		return "", err
+	}
+	curve := ecdh.X25519()
+	senderPub, err := curve.NewPublicKey(senderPubRaw)
+	if err != nil {
+		return "", err
+	}
+	secret, err := n.dmPriv.ECDH(senderPub)
+	if err != nil {
+		return "", err
+	}
+	key := sha256.Sum256(secret)
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce, err := base64.StdEncoding.DecodeString(msg.DMNonce)
+	if err != nil {
+		return "", err
+	}
+	cipherText, err := base64.StdEncoding.DecodeString(msg.DMCipher)
+	if err != nil {
+		return "", err
+	}
+	plain, err := gcm.Open(nil, nonce, cipherText, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
+}
+
+func (n *Node) cleanupIncomingTransfersLoop() {
+	t := time.NewTicker(1 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+			cleanupStaleIncomingP2PTransfers(5 * time.Minute)
+		}
+	}
+}
+
+func cleanupStaleIncomingP2PTransfers(maxIdle time.Duration) {
+	cutoff := time.Now().Add(-maxIdle)
+	incomingP2PFileMu.Lock()
+	defer incomingP2PFileMu.Unlock()
+	for id, tr := range incomingP2PFiles {
+		if tr.updatedAt.Before(cutoff) {
+			delete(incomingP2PFiles, id)
+		}
+	}
 }
