@@ -1,7 +1,6 @@
 ﻿package cli
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -171,7 +170,7 @@ func runDoctor(args []string) int {
 	if d, err := os.UserCacheDir(); err == nil {
 		fmt.Printf("cache: %s\n", filepath.Join(d, "brinco-cli"))
 	}
-	if d, err := profilesDir(); err == nil {
+	if d, err := profilesConfigDir(); err == nil {
 		fmt.Printf("config: %s\n", d)
 	}
 	if p, err := profilesPath(); err == nil {
@@ -245,12 +244,12 @@ func relaysFromProfiles() []string {
 	if err != nil {
 		return nil
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readProfilesFile(path)
 	if err != nil {
 		return nil
 	}
-	var all map[string]Profile
-	if err := json.Unmarshal(raw, &all); err != nil {
+	all, err := parseProfilesBytes(raw)
+	if err != nil {
 		return nil
 	}
 	var relays []string
