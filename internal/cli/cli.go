@@ -18,6 +18,7 @@ import (
 	"brinco-cli/internal/notify"
 	p2pcmd "brinco-cli/internal/p2p"
 	"brinco-cli/internal/roomproto"
+	"brinco-cli/internal/tui"
 	"brinco-cli/internal/updater"
 )
 
@@ -89,6 +90,9 @@ DENTRO DEL CHAT
   /send ruta           archivo chunked con progreso/checksum
   /diag /peers /code /quit /help
   Reacciones en linea sola: +1  -1  ok  :emoji:
+
+FLAGS (room create / join / host / join atajo)
+  --no-tui          modo linea clasico sin pantalla completa (o BRINCO_TUI=0)
 `
 
 const relayHelpText = `brinco relay — Servidor TCP para modo relay
@@ -328,9 +332,11 @@ type runtimeOptions struct {
 	NotifySound string
 	NotifyLevel string
 	FileLimit   string
+	NoTUI       bool
 }
 
 func applyRuntimeOptions(opts runtimeOptions) {
+	tui.SetForceLegacy(opts.NoTUI)
 	sound := true
 	switch strings.ToLower(strings.TrimSpace(opts.NotifySound)) {
 	case "off", "false", "0", "no":
@@ -452,7 +458,7 @@ func runHost(args []string) int {
 		*f.Mode = "direct"
 	}
 	pw := mergePass(*f.Password, *f.Pass)
-	applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit})
+	applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit, NoTUI: *f.NoTUI})
 	return execRoomCreate(*f.Name, *f.Mode, *f.Relay, *f.Direct, *f.Listen, *f.Public, pw)
 }
 
@@ -526,7 +532,7 @@ func runJoinShortcut(args []string) int {
 		}
 	}
 
-	applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit})
+	applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit, NoTUI: *jf.NoTUI})
 	return execRoomJoin(*jf.Name, code, *jf.Mode, relayVal, *jf.Direct, pw)
 }
 
@@ -551,7 +557,7 @@ func runRoom(args []string) int {
 			*f.Mode = "direct"
 		}
 		pw := mergePass(*f.Password, *f.Pass)
-		applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit})
+		applyRuntimeOptions(runtimeOptions{NotifySound: *f.NotifySound, NotifyLevel: *f.NotifyLevel, FileLimit: *f.FileLimit, NoTUI: *f.NoTUI})
 		return execRoomCreate(*f.Name, *f.Mode, *f.Relay, *f.Direct, *f.Listen, *f.Public, pw)
 
 	case "join":
@@ -577,7 +583,7 @@ func runRoom(args []string) int {
 			}
 		}
 		pw := mergePass(*jf.Password, *jf.Pass)
-		applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit})
+		applyRuntimeOptions(runtimeOptions{NotifySound: *jf.NotifySound, NotifyLevel: *jf.NotifyLevel, FileLimit: *jf.FileLimit, NoTUI: *jf.NoTUI})
 		return execRoomJoin(*jf.Name, c, *jf.Mode, *jf.Relay, *jf.Direct, pw)
 
 	case "code":

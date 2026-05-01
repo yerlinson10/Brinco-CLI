@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -72,12 +71,25 @@ func copyStdin(ctx context.Context, name, stdin string, args ...string) error {
 	return cmd.Run()
 }
 
+// RoomCodeFeedbackLines muestra el codigo en el chat e intenta copiarlo al portapapeles.
+// Devuelve lineas listas para imprimir o enviar a la TUI (orden: codigo, resultado o aviso).
+func RoomCodeFeedbackLines(code string) []string {
+	c := strings.TrimSpace(code)
+	if c == "" {
+		return []string{"No hay codigo disponible en esta sesion"}
+	}
+	out := []string{"Codigo de sala: " + c}
+	if err := Copy(c); err != nil {
+		out = append(out, fmt.Sprintf("Aviso: no se pudo copiar al portapapeles: %v", err))
+		return out
+	}
+	out = append(out, "Codigo copiado al portapapeles.")
+	return out
+}
+
 // AnnounceRoomCode copia code al portapapeles e informa en consola.
 func AnnounceRoomCode(code string) {
-	if err := Copy(code); err != nil {
-		fmt.Fprintf(os.Stderr, "Aviso: no se pudo copiar el codigo al portapapeles: %v\n", err)
-		fmt.Fprintf(os.Stdout, "Codigo de la sala: %s\n", code)
-		return
+	for _, ln := range RoomCodeFeedbackLines(code) {
+		fmt.Println(ln)
 	}
-	fmt.Println("Codigo copiado al portapapeles.")
 }

@@ -61,6 +61,7 @@ func readRelayTCPHostPortAndPassword(prompt, def, emptyErrMsg string) (relay, pa
 }
 
 func runHostGuided() int {
+	applyRuntimeOptions(runtimeOptions{NotifySound: "on", NotifyLevel: "all", FileLimit: "10MB", NoTUI: false})
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "=== Crear sala (asistente) ===")
 	fmt.Fprintln(os.Stderr, "Enter acepta el valor entre [corchetes].")
@@ -160,6 +161,7 @@ func runHostGuided() int {
 }
 
 func runJoinGuided() int {
+	applyRuntimeOptions(runtimeOptions{NotifySound: "on", NotifyLevel: "all", FileLimit: "10MB", NoTUI: false})
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "=== Unirse a sala (asistente) ===")
 	fmt.Fprintln(os.Stderr, "")

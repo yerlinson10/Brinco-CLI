@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bufio"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -20,10 +19,12 @@ import (
 	"sync"
 	"time"
 
+	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 	"brinco-cli/internal/notify"
 	"brinco-cli/internal/roomcode"
 	"brinco-cli/internal/roomproto"
+	"brinco-cli/internal/tui"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -113,6 +114,9 @@ type Node struct {
 	roomSecret       [32]byte
 	dmPriv           *ecdh.PrivateKey
 	dmPubB64         string
+
+	chatMu  sync.RWMutex
+	chatApp *tui.App
 }
 
 var (
@@ -629,62 +633,80 @@ func RandomTopic() (string, error) {
 // RunChat entra al chat interactivo de la sala
 func (n *Node) RunChat(roomCode string) int {
 	n.SetRoomCode(roomCode)
+
+	app := tui.New(tui.Options{Title: "Brinco", Mode: "p2p", Nick: n.name})
+	defer app.Shutdown()
+	if err := app.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error UI: %v\n", err)
+		return 1
+	}
+	n.chatMu.Lock()
+	n.chatApp = app
+	n.chatMu.Unlock()
+	defer func() {
+		n.chatMu.Lock()
+		n.chatApp = nil
+		n.chatMu.Unlock()
+	}()
+
 	go n.reconnectLoop()
 	go n.cleanupIncomingTransfersLoop()
 	go n.receiveLoop()
 
-	fmt.Println("Conectado al topic de la sala")
+	app.PushLine("Conectado al topic de la sala")
 	if n.TopicPeerCount() == 0 {
-		fmt.Println("Aviso: aun no hay peers enlazados. Esperando conexiones...")
+		app.PushLine("Aviso: aun no hay peers enlazados. Esperando conexiones...")
 	}
-	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	app.PushLine("Escribe mensajes y Enter para enviar")
+	app.PushLine("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 
-	stdin := bufio.NewScanner(os.Stdin)
 	localLimiter := &peerRate{tokens: 3, last: time.Now()}
 	history := make([]string, 0, 50)
 	for {
+		var line string
+		var ok bool
 		select {
 		case <-n.ctx.Done():
 			return 0
-		default:
+		case line, ok = <-app.Lines():
 		}
-
-		if !stdin.Scan() {
+		if !ok {
 			_ = n.Publish(n.name+" salio", "system")
+			app.ResetInterrupt()
 			return 0
 		}
-		line := strings.TrimSpace(stdin.Text())
 		if line == "" {
 			continue
 		}
 		if line == "!!" {
 			if len(history) == 0 {
-				fmt.Println("Historial vacio")
+				app.PushLine("Historial vacio")
 				continue
 			}
 			line = history[len(history)-1]
-			fmt.Printf("repite: %s\n", line)
+			app.PushLine("repite: " + line)
 		}
 		history = appendHistory(history, line, 40)
 
 		if isReaction(line) {
 			if !allowLocalP2P(localLimiter) {
-				printRateLimitLocalP2P()
+				n.chatPushRateLimit()
 				continue
 			}
 			reactionMsg := chatMessage{ID: newMessageID(), From: n.name, Text: line, Type: "reaction", At: time.Now().Unix(), Fingerprint: n.fingerprint(n.host.ID().String())}
 			if err := n.publishMessage(reactionMsg); err != nil {
 				fmt.Fprintf(os.Stderr, "Error enviando reaccion: %v\n", err)
 			} else {
-				renderMessage(reactionMsg, n.name)
+				for _, ln := range formatMessageLines(reactionMsg, n.name) {
+					n.chatPushLine(ln)
+				}
 			}
 			continue
 		}
 
 		if to, txt, ok := parseAtMentionP2P(line); ok {
 			if !allowLocalP2P(localLimiter) {
-				printRateLimitLocalP2P()
+				n.chatPushRateLimit()
 				continue
 			}
 			pmMsg, err := n.newPrivateMessage(to, txt)
@@ -697,7 +719,9 @@ func (n *Node) RunChat(roomCode string) int {
 			} else {
 				localPM := pmMsg
 				localPM.Text = txt
-				renderMessage(localPM, n.name)
+				for _, ln := range formatMessageLines(localPM, n.name) {
+					n.chatPushLine(ln)
+				}
 			}
 			continue
 		}
@@ -706,27 +730,30 @@ func (n *Node) RunChat(roomCode string) int {
 			switch {
 			case line == "/quit":
 				_ = n.Publish(n.name+" salio", "system")
+				app.Shutdown()
 				return 0
 			case line == "/code":
-				fmt.Printf("Codigo de sala: %s\n", roomCode)
+				for _, ln := range clipboard.RoomCodeFeedbackLines(roomCode) {
+					app.PushLine(ln)
+				}
 			case line == "/peers":
-				fmt.Printf("Peers enlazados al topic: %d\n", n.TopicPeerCount())
+				app.PushLine(fmt.Sprintf("Peers enlazados al topic: %d", n.TopicPeerCount()))
 			case line == "/diag":
 				n.printDiag()
 			case line == "/help":
-				fmt.Println("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
+				app.PushLine("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
 			case line == "/clear":
-				clearConsoleP2P()
+				n.chatPushClear()
 			case line == "/history":
-				printInputHistory(history)
+				n.chatPushHistory(formatP2PInputHistoryLines(history))
 			case strings.HasPrefix(line, "/msg "):
 				to, text, ok := parsePrivate(line)
 				if !ok {
-					fmt.Println("Uso: /msg <usuario> <texto>")
+					app.PushLine("Uso: /msg <usuario> <texto>")
 					continue
 				}
 				if !allowLocalP2P(localLimiter) {
-					printRateLimitLocalP2P()
+					n.chatPushRateLimit()
 					continue
 				}
 				pmMsg, err := n.newPrivateMessage(to, text)
@@ -739,26 +766,28 @@ func (n *Node) RunChat(roomCode string) int {
 				} else {
 					localPM := pmMsg
 					localPM.Text = text
-					renderMessage(localPM, n.name)
+					for _, ln := range formatMessageLines(localPM, n.name) {
+						n.chatPushLine(ln)
+					}
 				}
 			case strings.HasPrefix(line, "/send "):
 				if !allowLocalP2P(localLimiter) {
-					printRateLimitLocalP2P()
+					n.chatPushRateLimit()
 					continue
 				}
 				if err := n.sendFile(strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
 					fmt.Fprintf(os.Stderr, "Error enviando archivo: %v\n", err)
 				}
 			case strings.HasPrefix(line, "/kick ") || strings.HasPrefix(line, "/mute ") || strings.HasPrefix(line, "/unmute ") || strings.HasPrefix(line, "/ban "):
-				fmt.Println("Moderacion host no disponible en modo p2p/guaranteed (sin servidor central).")
+				app.PushLine("Moderacion host no disponible en modo p2p/guaranteed (sin servidor central).")
 			default:
-				fmt.Println("Comando no reconocido. Usa /help")
+				app.PushLine("Comando no reconocido. Usa /help")
 			}
 			continue
 		}
 
 		if !allowLocalP2P(localLimiter) {
-			printRateLimitLocalP2P()
+			n.chatPushRateLimit()
 			continue
 		}
 		if err := n.publishChatReliable(line); err != nil {
@@ -780,7 +809,9 @@ func (n *Node) publishChatReliable(text string) error {
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		renderMessage(msg, n.name)
+		for _, ln := range formatMessageLines(msg, n.name) {
+			n.chatPushLine(ln)
+		}
 		n.setConnectivity("connected")
 		return nil
 	}
@@ -828,7 +859,7 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 		if !n.bindPeerIdentity(senderPeerID, cm.From) {
-			fmt.Printf("[seguridad] alias '%s' en conflicto, posible suplantacion\n", strings.TrimSpace(cm.From))
+			n.chatPushLine(fmt.Sprintf("[seguridad] alias '%s' en conflicto, posible suplantacion", strings.TrimSpace(cm.From)))
 			continue
 		}
 		n.trackPeerPubKey(senderPeerID, cm.PubKey)
@@ -836,7 +867,7 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 		if cm.Fingerprint != "" && !n.trackFingerprint(senderPeerID, cm.Fingerprint) {
-			fmt.Printf("[seguridad] fingerprint cambio para %s, posible suplantacion\n", cm.From)
+			n.chatPushLine(fmt.Sprintf("[seguridad] fingerprint cambio para %s, posible suplantacion", cm.From))
 			continue
 		}
 		if !n.markSeen(cm.ID) {
@@ -856,7 +887,9 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 		n.setConnectivity("connected")
-		renderMessage(cm, n.name)
+		for _, ln := range formatMessageLines(cm, n.name) {
+			n.chatPushLine(ln)
+		}
 	}
 }
 
@@ -946,42 +979,107 @@ func (n *Node) markSeen(id string) bool {
 
 // --- Helpers de render ---
 
-func renderMessage(msg chatMessage, myNick string) {
+func formatMessageLines(msg chatMessage, myNick string) []string {
 	t := time.Unix(msg.At, 0).Format("15:04:05")
 	fromLabel := displayNickP2P(msg.From, myNick)
 	toLabel := displayNickP2P(msg.To, myNick)
 	switch msg.Type {
 	case "system":
 		triggerP2PNotification(msg, myNick)
-		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
+		return []string{fmt.Sprintf("[%s] %s", t, colorizeSystem(msg.Text))}
 	case "chat":
 		triggerP2PNotification(msg, myNick)
-		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] %s: %s", t, fromLabel, msg.Text)}
 	case "private":
 		triggerP2PNotification(msg, myNick)
-		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] [privado] %s -> %s: %s", t, fromLabel, toLabel, msg.Text)}
 	case "reaction":
 		triggerP2PNotification(msg, myNick)
-		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] %s reacciono %s", t, fromLabel, msg.Text)}
 	case "file":
 		path, size, err := saveIncomingP2PFile(msg)
 		triggerP2PNotification(msg, myNick)
 		if err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
-		} else {
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (no se pudo guardar: %v)", t, fromLabel, msg.FileName, err)}
 		}
+		return []string{fmt.Sprintf("[%s] %s envio archivo %s (%d bytes) guardado en: %s", t, fromLabel, msg.FileName, size, path)}
 	case "file_chunk":
 		result := saveIncomingP2PFileChunk(msg)
 		if result.Err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (error: %v)\n", t, fromLabel, msg.FileName, result.Err)
-			return
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (error: %v)", t, fromLabel, msg.FileName, result.Err)}
 		}
 		if result.Done {
 			triggerP2PNotification(msg, myNick)
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)}
 		}
 	}
+	return nil
+}
+
+func (n *Node) chatPushLine(s string) {
+	n.chatMu.RLock()
+	app := n.chatApp
+	n.chatMu.RUnlock()
+	if app != nil {
+		app.PushLine(s)
+		return
+	}
+	fmt.Println(s)
+}
+
+func (n *Node) chatPushHistory(lines []string) {
+	n.chatMu.RLock()
+	app := n.chatApp
+	n.chatMu.RUnlock()
+	if app != nil {
+		app.PushHistory(lines)
+		return
+	}
+	for _, ln := range lines {
+		fmt.Println(ln)
+	}
+}
+
+func (n *Node) chatPushClear() {
+	n.chatMu.RLock()
+	app := n.chatApp
+	n.chatMu.RUnlock()
+	if app != nil {
+		app.PushClear()
+		return
+	}
+	clearConsoleP2P()
+}
+
+func (n *Node) chatPushRateLimit() {
+	n.chatMu.RLock()
+	app := n.chatApp
+	n.chatMu.RUnlock()
+	if app != nil && app.UsedTTY() {
+		msg := "Rate limit: espera unos segundos antes de seguir enviando."
+		if supportsColor() {
+			app.PushLine("\x1b[91m" + msg + "\x1b[0m")
+		} else {
+			app.PushLine(msg)
+		}
+		return
+	}
+	printRateLimitLocalP2P()
+}
+
+func formatP2PInputHistoryLines(history []string) []string {
+	if len(history) == 0 {
+		return []string{"Historial vacio"}
+	}
+	start := 0
+	if len(history) > 20 {
+		start = len(history) - 20
+	}
+	out := make([]string, 0, len(history)-start)
+	for i := start; i < len(history); i++ {
+		out = append(out, fmt.Sprintf("%2d) %s", i-start+1, history[i]))
+	}
+	return out
 }
 
 func triggerP2PNotification(msg chatMessage, myNick string) {
@@ -1040,10 +1138,14 @@ func (n *Node) connectivityState() string {
 	return n.connectivity
 }
 
-func (n *Node) printDiag() {
+func (n *Node) formatDiagLines() []string {
 	if n.topic == nil {
-		fmt.Printf("Estado: %s\nPeers topic: 0\nRelay activo: no\nNAT: desconocido\n", n.connectivityState())
-		return
+		return []string{
+			fmt.Sprintf("Estado: %s", n.connectivityState()),
+			"Peers topic: 0",
+			"Relay activo: no",
+			"NAT: desconocido",
+		}
 	}
 	relay := "no"
 	for _, addr := range n.host.Addrs() {
@@ -1063,10 +1165,22 @@ func (n *Node) printDiag() {
 	if nat == "desconocido" && len(n.host.Addrs()) > 0 {
 		nat = "posible publico"
 	}
-	fmt.Printf("Estado: %s\nPeers topic: %d\nRelay activo: %s\nNAT: %s\n", n.connectivityState(), n.TopicPeerCount(), relay, nat)
+	out := []string{
+		fmt.Sprintf("Estado: %s", n.connectivityState()),
+		fmt.Sprintf("Peers topic: %d", n.TopicPeerCount()),
+		fmt.Sprintf("Relay activo: %s", relay),
+		fmt.Sprintf("NAT: %s", nat),
+	}
 	for _, pid := range n.ps.ListPeers(n.topic.String()) {
 		res := <-ping.Ping(n.ctx, n.host, pid)
-		fmt.Printf("- %s RTT=%s\n", pid.String(), res.RTT)
+		out = append(out, fmt.Sprintf("- %s RTT=%s", pid.String(), res.RTT))
+	}
+	return out
+}
+
+func (n *Node) printDiag() {
+	for _, ln := range n.formatDiagLines() {
+		n.chatPushLine(ln)
 	}
 }
 
@@ -1252,7 +1366,7 @@ func (n *Node) sendFile(path string) error {
 		}
 	}
 	t := time.Now().Format("15:04:05")
-	fmt.Printf("[%s] %s envio archivo %s (%s, sha256=%s)\n", t, displayNickP2P(n.name, n.name), name, formatBytes(int64(len(raw))), checksum)
+	n.chatPushLine(fmt.Sprintf("[%s] %s envio archivo %s (%s, sha256=%s)", t, displayNickP2P(n.name, n.name), name, formatBytes(int64(len(raw))), checksum))
 	return nil
 }
 

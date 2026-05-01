@@ -22,6 +22,7 @@ import (
 	"brinco-cli/internal/notify"
 	"brinco-cli/internal/roomcode"
 	"brinco-cli/internal/roomproto"
+	"brinco-cli/internal/tui"
 )
 
 const (
@@ -796,6 +797,15 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 		return 1
 	}
 
+	app := tui.New(tui.Options{Title: "Brinco", Mode: "direct", Nick: strings.TrimSpace(name)})
+	defer app.Shutdown()
+	if err := app.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error UI: %v\n", err)
+		return 1
+	}
+	app.PushLine("Escribe mensajes y Enter para enviar")
+	app.PushLine("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
+
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	ht := &roomHostTracker{}
@@ -825,6 +835,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)
 				nickMu.Unlock()
+				app.SetStatus("nick: " + myNick)
 			}
 			nickMu.RLock()
 			currentNick := myNick
@@ -832,31 +843,11 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			if shouldSkipOwnEcho(msg, currentNick) {
 				continue
 			}
-			renderWireMessage(msg, currentNick, ht)
+			flushWireMessage(app, msg, currentNick, ht)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
 		}
-	}()
-
-	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
-
-	stdinLines := make(chan string, stdinLineChanCap)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			select {
-			case stdinLines <- line:
-			case <-done:
-				return
-			}
-		}
-		if err := sc.Err(); err != nil {
-			logx.Debug("chat client stdin", "err", err)
-		}
-		close(stdinLines)
 	}()
 
 	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
@@ -864,6 +855,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	for {
 		select {
 		case <-done:
+			app.Shutdown()
 			select {
 			case err := <-errCh:
 				fmt.Fprintf(os.Stderr, "Conexion cerrada: %v\n", err)
@@ -871,9 +863,10 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			default:
 			}
 			return 0
-		case line, ok := <-stdinLines:
+		case line, ok := <-app.Lines():
 			if !ok {
 				_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
+				app.ResetInterrupt()
 				return 0
 			}
 			if line == "" {
@@ -881,17 +874,17 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			}
 			if line == "!!" {
 				if len(history) == 0 {
-					fmt.Println("Historial vacio")
+					app.PushLine("Historial vacio")
 					continue
 				}
 				line = history[len(history)-1]
-				fmt.Printf("repite: %s\n", line)
+				app.PushLine("repite: " + line)
 			}
 			history = appendHistory(history, line, 40)
 
 			if isReaction(line) {
 				if !localLimiter.allow() {
-					printRateLimitLocal()
+					pushRateLimit(app)
 					continue
 				}
 				_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
@@ -900,7 +893,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 
 			if to, txt, ok := parseAtMention(line); ok {
 				if !localLimiter.allow() {
-					printRateLimitLocal()
+					pushRateLimit(app)
 					continue
 				}
 				_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
@@ -911,27 +904,26 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 				switch line {
 				case "/quit":
 					_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
+					app.Shutdown()
 					return 0
 				case "/peers":
 					_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
 				case "/diag":
 					_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
 				case "/code":
-					if strings.TrimSpace(roomCode) != "" {
-						fmt.Printf("Codigo de sala: %s\n", roomCode)
-					} else {
-						fmt.Println("No hay codigo disponible en esta sesion")
+					for _, ln := range clipboard.RoomCodeFeedbackLines(roomCode) {
+						app.PushLine(ln)
 					}
 				case "/help":
-					fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u t | /send archivo /quit /help")
+					app.PushLine("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u t | /send archivo /quit /help")
 				case "/clear":
-					clearConsole()
+					app.PushClear()
 				case "/history":
-					printInputHistory(history)
+					pushInputHistory(app, history)
 				default:
 					if isModerationCommandLine(line) {
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
 						_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
@@ -940,31 +932,34 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 					if strings.HasPrefix(line, "/msg ") {
 						to, text, ok := parsePrivateCommand(line)
 						if !ok {
-							fmt.Println("Uso: /msg <usuario> <texto>")
+							app.PushLine("Uso: /msg <usuario> <texto>")
 							continue
 						}
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
 						_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
 					} else if strings.HasPrefix(line, "/send ") {
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
-						if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
+						okMsg, err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
+						if err != nil {
 							fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
+						} else if okMsg != "" {
+							app.PushLine(okMsg)
 						}
 					} else {
-						fmt.Println("Comando no reconocido. Usa /help")
+						app.PushLine("Comando no reconocido. Usa /help")
 					}
 				}
 				continue
 			}
 
 			if !localLimiter.allow() {
-				printRateLimitLocal()
+				pushRateLimit(app)
 				continue
 			}
 			at := time.Now().Unix()
@@ -975,7 +970,7 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 			nickMu.RLock()
 			currentNick := myNick
 			nickMu.RUnlock()
-			renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
+			flushWireMessage(app, wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 		}
 	}
 }
@@ -1146,7 +1141,8 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%dB", n)
 }
 
-func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
+// formatWireMessageLines formats one incoming wire message as display lines (ANSI).
+func formatWireMessageLines(msg wireMessage, myNick string, ht *roomHostTracker) []string {
 	if ht != nil && msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Host) != "" {
 		ht.set(msg.Host)
 	}
@@ -1156,8 +1152,7 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 		}
 		t := time.Unix(msg.At, 0).Format("15:04:05")
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s\n", t, colorizeSystem("Nuevo host de la sala: "+strings.TrimSpace(msg.Host)))
-		return
+		return []string{fmt.Sprintf("[%s] %s", t, colorizeSystem("Nuevo host de la sala: "+strings.TrimSpace(msg.Host)))}
 	}
 
 	t := time.Unix(msg.At, 0).Format("15:04:05")
@@ -1170,58 +1165,105 @@ func renderWireMessage(msg wireMessage, myNick string, ht *roomHostTracker) {
 	switch msg.Type {
 	case msgTypeWelcome:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
+		out := []string{fmt.Sprintf("[%s] %s", t, colorizeSystem(msg.Text))}
 		if strings.TrimSpace(msg.Assigned) != "" {
-			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Tu nombre:"), msg.Assigned)
+			out = append(out, fmt.Sprintf("[%s] %s %s", t, colorizeSystem("Tu nombre:"), msg.Assigned))
 		}
 		if msg.Code != "" {
-			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Codigo:"), msg.Code)
+			out = append(out, fmt.Sprintf("[%s] %s %s", t, colorizeSystem("Codigo:"), msg.Code))
 		}
 		if len(msg.Peers) > 0 {
-			fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
+			out = append(out, fmt.Sprintf("[%s] %s %s", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", ")))
 		}
+		return out
 	case msgTypeSystem:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s\n", t, colorizeSystem(msg.Text))
+		return []string{fmt.Sprintf("[%s] %s", t, colorizeSystem(msg.Text))}
 	case msgTypeError:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s\n", t, colorizeError(msg.Text))
+		return []string{fmt.Sprintf("[%s] %s", t, colorizeError(msg.Text))}
 	case msgTypePeers:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s %s\n", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))
+		return []string{fmt.Sprintf("[%s] %s %s", t, colorizeSystem("Peers:"), strings.Join(msg.Peers, ", "))}
 	case msgTypeDiag:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s\n", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)
+		return []string{fmt.Sprintf("[%s] %s estado=%s rtt=%dms relay=%t nat=%s", t, colorizeSystem("Diag:"), msg.State, msg.RTTMs, msg.RelayUsed, msg.NATEst)}
 	case msgTypeChat:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s: %s\n", t, fromLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] %s: %s", t, fromLabel, msg.Text)}
 	case msgTypePrivate:
 		if myNick != "" && msg.To != myNick && msg.From != myNick {
-			return
+			return nil
 		}
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] [privado] %s -> %s: %s\n", t, fromLabel, toLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] [privado] %s -> %s: %s", t, fromLabel, toLabel, msg.Text)}
 	case msgTypeReaction:
 		triggerNotification(msg, myNick)
-		fmt.Printf("[%s] %s reacciono %s\n", t, fromLabel, msg.Text)
+		return []string{fmt.Sprintf("[%s] %s reacciono %s", t, fromLabel, msg.Text)}
 	case msgTypeFile:
 		path, size, err := saveIncomingFile(msg)
 		triggerNotification(msg, myNick)
 		if err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (no se pudo guardar: %v)\n", t, fromLabel, msg.FileName, err)
-		} else {
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes) guardado en: %s\n", t, fromLabel, msg.FileName, size, path)
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (no se pudo guardar: %v)", t, fromLabel, msg.FileName, err)}
 		}
+		return []string{fmt.Sprintf("[%s] %s envio archivo %s (%d bytes) guardado en: %s", t, fromLabel, msg.FileName, size, path)}
 	case msgTypeFileChunk:
 		result := saveIncomingFileChunk(msg)
 		if result.Err != nil {
-			fmt.Printf("[%s] %s envio archivo %s (error: %v)\n", t, fromLabel, msg.FileName, result.Err)
-			return
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (error: %v)", t, fromLabel, msg.FileName, result.Err)}
 		}
 		if result.Done {
 			triggerNotification(msg, myNick)
-			fmt.Printf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s\n", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)
+			return []string{fmt.Sprintf("[%s] %s envio archivo %s (%d bytes, sha256=%s) guardado en: %s", t, fromLabel, msg.FileName, result.Size, msg.Checksum, result.Path)}
 		}
+	}
+	return nil
+}
+
+func flushWireMessage(app *tui.App, msg wireMessage, myNick string, ht *roomHostTracker) {
+	for _, ln := range formatWireMessageLines(msg, myNick, ht) {
+		app.PushLine(ln)
+	}
+}
+
+func rateLimitChatLine() string {
+	msg := "Rate limit: espera unos segundos antes de seguir enviando."
+	if !supportsColor() {
+		return msg
+	}
+	return "\x1b[91m" + msg + "\x1b[0m"
+}
+
+func pushRateLimit(app *tui.App) {
+	if app.UsedTTY() {
+		app.PushLine(rateLimitChatLine())
+		return
+	}
+	printRateLimitLocal()
+}
+
+func formatInputHistoryLines(history []string) []string {
+	if len(history) == 0 {
+		return []string{"Historial vacio"}
+	}
+	start := 0
+	if len(history) > 20 {
+		start = len(history) - 20
+	}
+	out := make([]string, 0, len(history)-start)
+	for i := start; i < len(history); i++ {
+		out = append(out, fmt.Sprintf("%2d) %s", i-start+1, history[i]))
+	}
+	return out
+}
+
+func pushInputHistory(app *tui.App, history []string) {
+	app.PushHistory(formatInputHistoryLines(history))
+}
+
+func pushRoomCodeAnnouncement(app *tui.App, code string) {
+	for _, ln := range clipboard.RoomCodeFeedbackLines(code) {
+		app.PushLine(ln)
 	}
 }
 
@@ -1392,18 +1434,17 @@ func buildFileMessage(path string) (wireMessage, error) {
 	}, nil
 }
 
-func sendFileChunks(conn net.Conn, path string) error {
+func sendFileChunks(conn net.Conn, path string) (okMsg string, err error) {
 	chunks, total, checksum, name, err := buildFileChunks(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for _, msg := range chunks {
 		if err := writeMessage(conn, msg); err != nil {
-			return err
+			return "", err
 		}
 	}
-	fmt.Printf("archivo enviado: %s (%s, sha256=%s)\n", name, formatBytes(total), checksum)
-	return nil
+	return fmt.Sprintf("archivo enviado: %s (%s, sha256=%s)", name, formatBytes(total), checksum), nil
 }
 
 func buildFileChunks(path string) ([]wireMessage, int64, string, string, error) {

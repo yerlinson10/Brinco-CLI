@@ -11,6 +11,7 @@ type roomCreateFlags struct {
 	Name, Mode, Relay, Listen, Public, Password, Pass *string
 	Direct                                             *bool
 	NotifySound, NotifyLevel, FileLimit                *string
+	NoTUI                                              *bool
 }
 
 type roomCreateFlagDoc struct {
@@ -48,6 +49,7 @@ func registerRoomCreateFlags(fs *flag.FlagSet, doc roomCreateFlagDoc) roomCreate
 		NotifySound: fs.String("notify-sound", "on", "Sonido: on | off"),
 		NotifyLevel: fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none"),
 		FileLimit:   fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)"),
+		NoTUI:       fs.Bool("no-tui", false, "Sin TUI: modo linea clasico (BRINCO_TUI=0)"),
 	}
 }
 
@@ -55,6 +57,7 @@ type roomJoinFlags struct {
 	Name, Code, Mode, Relay, Password, Pass *string
 	Direct                                   *bool
 	NotifySound, NotifyLevel, FileLimit      *string
+	NoTUI                                    *bool
 }
 
 type roomJoinFlagDoc struct {
@@ -93,6 +96,7 @@ func registerRoomJoinFlags(fs *flag.FlagSet, doc roomJoinFlagDoc) roomJoinFlags 
 		NotifySound: fs.String("notify-sound", "on", "Sonido: on | off"),
 		NotifyLevel: fs.String("notify-level", "all", "Notificaciones: all | direct | mentions | none"),
 		FileLimit:   fs.String("file-limit", "10MB", "Limite para /send (ej. 10MB)"),
+		NoTUI:       fs.Bool("no-tui", false, "Sin TUI: modo linea clasico (BRINCO_TUI=0)"),
 	}
 }
 

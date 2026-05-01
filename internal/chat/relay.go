@@ -16,6 +16,7 @@ import (
 	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 	"brinco-cli/internal/roomproto"
+	"brinco-cli/internal/tui"
 )
 
 type relayHub struct {
@@ -597,6 +598,19 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 		return 1
 	}
 
+	mode := strings.TrimSpace(codeProtocol)
+	if mode == "" {
+		mode = "relay"
+	}
+	app := tui.New(tui.Options{Title: "Brinco", Mode: mode, Nick: strings.TrimSpace(name)})
+	defer app.Shutdown()
+	if err := app.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error UI: %v\n", err)
+		return 1
+	}
+	app.PushLine("Escribe mensajes y Enter para enviar")
+	app.PushLine("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
+
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	codeCh := make(chan string, 1)
@@ -627,6 +641,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				nickMu.Lock()
 				myNick = strings.TrimSpace(msg.Assigned)
 				nickMu.Unlock()
+				app.SetStatus("nick: " + myNick)
 			}
 			if msg.Type == msgTypeWelcome && strings.TrimSpace(msg.Code) != "" {
 				if create && strings.TrimSpace(codeProtocol) != "" {
@@ -643,31 +658,11 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			if shouldSkipOwnEcho(msg, currentNick) {
 				continue
 			}
-			renderWireMessage(msg, currentNick, ht)
+			flushWireMessage(app, msg, currentNick, ht)
 		}
 		if err := scanner.Err(); err != nil {
 			errCh <- err
 		}
-	}()
-
-	fmt.Println("Escribe mensajes y Enter para enviar")
-	fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
-
-	stdinLines := make(chan string, stdinLineChanCap)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			select {
-			case stdinLines <- line:
-			case <-done:
-				return
-			}
-		}
-		if err := sc.Err(); err != nil {
-			logx.Debug("relay client stdin", "err", err)
-		}
-		close(stdinLines)
 	}()
 
 	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
@@ -680,7 +675,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				roomCode = c
 				_ = SaveLastRoomCode(c)
 				if create {
-					clipboard.AnnounceRoomCode(c)
+					pushRoomCodeAnnouncement(app, c)
 				}
 				logx.Info("relay room code received", "protocol", codeProtocol)
 			default:
@@ -690,6 +685,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 
 		select {
 		case <-done:
+			app.Shutdown()
 			select {
 			case err := <-errCh:
 				fmt.Fprintf(os.Stderr, "Conexion cerrada: %v\n", err)
@@ -697,9 +693,10 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			default:
 			}
 			return 0
-		case line, ok := <-stdinLines:
+		case line, ok := <-app.Lines():
 			if !ok {
 				_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
+				app.ResetInterrupt()
 				return 0
 			}
 			if line == "" {
@@ -707,17 +704,17 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			}
 			if line == "!!" {
 				if len(history) == 0 {
-					fmt.Println("Historial vacio")
+					app.PushLine("Historial vacio")
 					continue
 				}
 				line = history[len(history)-1]
-				fmt.Printf("repite: %s\n", line)
+				app.PushLine("repite: " + line)
 			}
 			history = appendHistory(history, line, 40)
 
 			if isReaction(line) {
 				if !localLimiter.allow() {
-					printRateLimitLocal()
+					pushRateLimit(app)
 					continue
 				}
 				_ = writeMessage(conn, wireMessage{Type: msgTypeReaction, Text: line, At: time.Now().Unix()})
@@ -726,7 +723,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 
 			if to, txt, ok := parseAtMention(line); ok {
 				if !localLimiter.allow() {
-					printRateLimitLocal()
+					pushRateLimit(app)
 					continue
 				}
 				_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: txt, At: time.Now().Unix()})
@@ -737,27 +734,26 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 				switch line {
 				case "/quit":
 					_ = writeMessage(conn, wireMessage{Type: msgTypeQuit, At: time.Now().Unix()})
+					app.Shutdown()
 					return 0
 				case "/peers":
 					_ = writeMessage(conn, wireMessage{Type: msgTypePeersReq, At: time.Now().Unix()})
 				case "/diag":
 					_ = writeMessage(conn, wireMessage{Type: msgTypeDiagReq, At: time.Now().Unix()})
 				case "/code":
-					if strings.TrimSpace(roomCode) != "" {
-						fmt.Printf("Codigo de sala: %s\n", roomCode)
-					} else {
-						fmt.Println("No hay codigo disponible en esta sesion")
+					for _, ln := range clipboard.RoomCodeFeedbackLines(roomCode) {
+						app.PushLine(ln)
 					}
 				case "/help":
-					fmt.Println("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
+					app.PushLine("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
 				case "/clear":
-					clearConsole()
+					app.PushClear()
 				case "/history":
-					printInputHistory(history)
+					pushInputHistory(app, history)
 				default:
 					if isModerationCommandLine(line) {
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
 						_ = writeMessage(conn, wireMessage{Type: msgTypeModCmd, Text: line, At: time.Now().Unix()})
@@ -766,31 +762,34 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 					if strings.HasPrefix(line, "/msg ") {
 						to, text, ok := parsePrivateCommand(line)
 						if !ok {
-							fmt.Println("Uso: /msg <usuario> <texto>")
+							app.PushLine("Uso: /msg <usuario> <texto>")
 							continue
 						}
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
 						_ = writeMessage(conn, wireMessage{Type: msgTypePrivate, To: to, Text: text, At: time.Now().Unix()})
 					} else if strings.HasPrefix(line, "/send ") {
 						if !localLimiter.allow() {
-							printRateLimitLocal()
+							pushRateLimit(app)
 							continue
 						}
-						if err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send "))); err != nil {
+						okMsg, err := sendFileChunks(conn, strings.TrimSpace(strings.TrimPrefix(line, "/send ")))
+						if err != nil {
 							fmt.Fprintf(os.Stderr, "Error /send: %v\n", err)
+						} else if okMsg != "" {
+							app.PushLine(okMsg)
 						}
 					} else {
-						fmt.Println("Comando no reconocido. Usa /help")
+						app.PushLine("Comando no reconocido. Usa /help")
 					}
 				}
 				continue
 			}
 
 			if !localLimiter.allow() {
-				printRateLimitLocal()
+				pushRateLimit(app)
 				continue
 			}
 			at := time.Now().Unix()
@@ -801,7 +800,7 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 			nickMu.RLock()
 			currentNick := myNick
 			nickMu.RUnlock()
-			renderWireMessage(wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
+			flushWireMessage(app, wireMessage{Type: msgTypeChat, From: currentNick, Text: line, At: at}, currentNick, ht)
 		}
 	}
 }
