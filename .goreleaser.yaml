@@ -43,6 +43,8 @@ signs:
     signature: "${artifact}.minisig"
     args:
       - -S
+      # CI sin TTY: clave sin passphrase (minisign -G -W o minisign -C -W). Requiere minisign >= 0.11.
+      - -W
       - -s
       - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
       - -m

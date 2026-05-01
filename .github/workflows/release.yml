@@ -26,8 +26,15 @@ jobs:
 
       - name: Install minisign
         run: |
-          sudo apt-get update
-          sudo apt-get install -y minisign
+          set -euo pipefail
+          VER=0.12
+          curl -fsSL "https://github.com/jedisct1/minisign/releases/download/${VER}/minisign-${VER}-linux.tar.gz" -o /tmp/minisign.tgz
+          mkdir -p /tmp/minisign-extract
+          tar xzf /tmp/minisign.tgz -C /tmp/minisign-extract
+          BIN="$(find /tmp/minisign-extract -type f -name minisign | head -1)"
+          test -n "$BIN"
+          sudo install -m755 "$BIN" /usr/local/bin/minisign
+          minisign -V
 
       - name: Prepare minisign private key
         if: github.event_name == 'release'
@@ -37,6 +44,8 @@ jobs:
             echo "MINISIGN_SECRET_KEY no esta configurado en secretos." >&2
             exit 1
           fi
+          # Debe ser una clave privada SIN passphrase (compatible con minisign -S -W en CI).
+          # Quitar cifrado localmente: minisign -C -W -s tu.key (ver minisign --help).
           keyfile="$RUNNER_TEMP/minisign.key"
           printf '%s\n' "${{ secrets.MINISIGN_SECRET_KEY }}" > "$keyfile"
           chmod 600 "$keyfile"
