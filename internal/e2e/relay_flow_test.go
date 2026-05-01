@@ -10,6 +10,7 @@ import (
 
 func TestRelayCreateJoinLeave(t *testing.T) {
 	lockSharedChatRoomCodeCache(t)
+	clearSharedChatRoomCodeCacheFile(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	relayAddr := freeLocalAddr(t)

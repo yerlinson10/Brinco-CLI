@@ -675,22 +675,14 @@ func runRelayClient(relayAddr, roomID, name, password, roomCode string, create b
 	localLimiter := &inputRateLimiter{tokens: 3, max: 3, refillPerSec: 0.55, last: time.Now()}
 	history := make([]string, 0, 50)
 	for {
-	codes:
-		for {
-			select {
-			case c := <-codeCh:
-				roomCode = c
-				_ = SaveLastRoomCode(c)
-				if create {
-					pushRoomCodeAnnouncement(app, c)
-				}
-				logx.Info("relay room code received", "protocol", codeProtocol)
-			default:
-				break codes
-			}
-		}
-
 		select {
+		case c := <-codeCh:
+			roomCode = c
+			_ = SaveLastRoomCode(c)
+			if create {
+				pushRoomCodeAnnouncement(app, c)
+			}
+			logx.Info("relay room code received", "protocol", codeProtocol)
 		case <-done:
 			app.Shutdown()
 			select {

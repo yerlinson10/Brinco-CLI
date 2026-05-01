@@ -20,6 +20,20 @@ func lockSharedChatRoomCodeCache(t *testing.T) {
 	t.Cleanup(chatRoomCodeCacheSerial.Unlock)
 }
 
+// clearSharedChatRoomCodeCacheFile borra el ultimo codigo chat (direct/relay).
+// Sin esto, waitHostThenReadCachedRoomCode puede leer el codigo del test anterior
+// (p. ej. direct en 127.0.0.1:19091) en cuanto aparece la TUI, antes de que el
+// host actual escriba el archivo.
+func clearSharedChatRoomCodeCacheFile(t *testing.T) {
+	t.Helper()
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, e2eChatLastRoomCodeFile)
+	_ = os.Remove(path)
+}
+
 const (
 	e2eChatLastRoomCodeFile = "brinco-last-room-code.txt"
 	e2eP2PLastCodeFile      = "brinco-last-p2p-code.txt"
