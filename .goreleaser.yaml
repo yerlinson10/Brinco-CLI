@@ -36,6 +36,22 @@ archives:
 checksum:
   name_template: checksums.txt
 
+signs:
+  - id: checksums_minisign
+    artifacts: checksum
+    cmd: minisign
+    signature: "${artifact}.minisig"
+    args:
+      - -S
+      - -s
+      - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
+      - -m
+      - "${artifact}"
+      - -x
+      - "${signature}"
+      - -t
+      - "Brinco checksums signature"
+
 release:
   github:
     owner: yerlinson10
@@ -62,6 +78,22 @@ scoops:
       branch: main
     homepage: https://github.com/yerlinson10/Brinco-CLI
     description: Chat CLI P2P en Go con salas y codigos de invitacion
+    commit_author:
+      name: brinco-bot
+      email: actions@github.com
+
+brews:
+  - name: brinco
+    homepage: https://github.com/yerlinson10/Brinco-CLI
+    description: Chat CLI P2P en Go con salas y codigos de invitacion
+    license: MIT
+    test: |
+      system "#{bin}/brinco", "version"
+    repository:
+      owner: yerlinson10
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     commit_author:
       name: brinco-bot
       email: actions@github.com

@@ -7,9 +7,73 @@ import (
 	"strings"
 	"time"
 
-	"brinco-cli/internal/clipboard"
 	"brinco-cli/internal/logx"
 )
+
+const (
+	defaultRelayProbeTimeout        = 900 * time.Millisecond
+	defaultWaitRelayTimeout         = 30 * time.Second
+	defaultJoinConnectRetries       = 5
+	defaultJoinConnectRetryDelay    = 700 * time.Millisecond
+	guaranteedJoinConnectRetries    = 8
+	guaranteedJoinConnectRetryDelay = 1 * time.Second
+)
+
+func logNonFatal(action string, err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Advertencia: %s: %v\n", action, err)
+	logx.Warn("p2p non-fatal", "action", action, "err", err)
+}
+
+func persistRoomCode(code string) {
+	logNonFatal("no se pudo guardar el ultimo codigo", saveLastCode(code))
+}
+
+func publishSystemEvent(node *Node, message string) {
+	logNonFatal("no se pudo publicar mensaje de sistema", node.Publish(message, "system"))
+}
+
+func persistPeerPreferenceAfterJoin(node *Node, topic string, dialList []string) {
+	topic = strings.TrimSpace(topic)
+	if topic == "" || len(dialList) == 0 {
+		return
+	}
+	addr := node.PickWorkingPeerAddrFromCandidates(dialList)
+	if addr == "" {
+		return
+	}
+	logNonFatal("no se pudo persistir preferencia de peer", saveLastWorkingPeer(topic, addr))
+}
+
+func newNodeWithDefaults(guaranteed bool, relayAddrs []string) (*Node, error) {
+	ctx := context.Background()
+	nodeFactory := NewNode
+	if guaranteed {
+		nodeFactory = NewNodeGuaranteed
+	}
+	return nodeFactory(ctx, relayAddrs)
+}
+
+func pickRelayAndEnable(node *Node, relayAddrs []string) {
+	bestRelay := selectBestP2PRelay(relayAddrs, defaultRelayProbeTimeout)
+	if bestRelay == "" {
+		return
+	}
+	if err := node.EnableRelayCircuit(bestRelay); err != nil {
+		fmt.Fprintf(os.Stderr, "Advertencia: relay no disponible: %v\n", err)
+		return
+	}
+	fmt.Printf("Relay propio activado: %s\n", bestRelay)
+}
+
+func waitForRelayOrWarn(node *Node) bool {
+	fmt.Print("Esperando direccion relay")
+	gotRelay := node.WaitForRelay(defaultWaitRelayTimeout)
+	fmt.Println()
+	return gotRelay
+}
 
 // RunCreate crea una sala nueva usando libp2p + red publica IPFS
 // Si se pasa relayAddr, usa ese relay propio ademas de la red publica
@@ -21,13 +85,9 @@ func RunCreate(name, relayAddr string) int {
 
 	fmt.Println("Iniciando nodo P2P...")
 
-	var relayAddrs []string
-	if strings.TrimSpace(relayAddr) != "" {
-		relayAddrs = append(relayAddrs, relayAddr)
-	}
+	relayAddrs := splitRelayList(relayAddr)
 
-	ctx := context.Background()
-	node, err := NewNode(ctx, relayAddrs)
+	node, err := newNodeWithDefaults(false, relayAddrs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creando nodo: %v\n", err)
 		return 1
@@ -39,13 +99,7 @@ func RunCreate(name, relayAddr string) int {
 	fmt.Println("Conectando a la red P2P...")
 	node.Bootstrap(relayAddrs)
 
-	if strings.TrimSpace(relayAddr) != "" {
-		if err := node.EnableRelayCircuit(relayAddr); err != nil {
-			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo reservar circuito relay: %v\n", err)
-		} else {
-			fmt.Println("Relay propio activado")
-		}
-	}
+	pickRelayAndEnable(node, relayAddrs)
 
 	topic, err := RandomTopic()
 	if err != nil {
@@ -57,24 +111,19 @@ func RunCreate(name, relayAddr string) int {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
 		return 1
 	}
+	node.SetRoomTopic(topic)
 
-	code, err := BuildRoomCode(topic, relayAddr, node.AdvertisePeerAddrs())
+	code, err := BuildRoomCode(topic, strings.Join(relayAddrs, ","), node.AdvertisePeerAddrs())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error generando codigo: %v\n", err)
 		return 1
 	}
 
-	_ = saveLastCode(code)
+	persistRoomCode(code)
 
-	fmt.Printf("\nSala creada exitosamente\n")
-	fmt.Printf("Codigo de sala: %s\n", code)
-	clipboard.AnnounceRoomCode(code)
-	fmt.Printf("Peer ID:        %s\n", node.ID())
-	fmt.Println("Comparte el codigo con tus peers")
-	fmt.Println()
 	logx.Info("p2p sala creada", "peerID", node.ID())
 
-	_ = node.Publish(name+" creo la sala", "system")
+	publishSystemEvent(node, name+" creo la sala")
 	return node.RunChat(code)
 }
 
@@ -96,22 +145,17 @@ func RunJoin(name, code, relayAddr string) int {
 	}
 
 	topic := payload.Topic
-	codeRelay := payload.Relay
+	codeRelays := payload.relayCandidates()
 
 	// El relay del codigo tiene prioridad; si el usuario tambien paso --relay, lo agrega
-	effectiveRelay := codeRelay
-	if strings.TrimSpace(relayAddr) != "" {
-		effectiveRelay = relayAddr
+	relayAddrs := codeRelays
+	if cliRelays := splitRelayList(relayAddr); len(cliRelays) > 0 {
+		relayAddrs = append(cliRelays, relayAddrs...)
 	}
-
-	var relayAddrs []string
-	if strings.TrimSpace(effectiveRelay) != "" {
-		relayAddrs = append(relayAddrs, effectiveRelay)
-	}
+	relayAddrs = uniqueStrings(relayAddrs)
 
 	fmt.Println("Iniciando nodo P2P...")
-	ctx := context.Background()
-	node, err := NewNode(ctx, relayAddrs)
+	node, err := newNodeWithDefaults(false, relayAddrs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creando nodo: %v\n", err)
 		return 1
@@ -123,30 +167,30 @@ func RunJoin(name, code, relayAddr string) int {
 	fmt.Println("Conectando a la red P2P...")
 	node.Bootstrap(relayAddrs)
 
-	if strings.TrimSpace(effectiveRelay) != "" {
-		if err := node.EnableRelayCircuit(effectiveRelay); err != nil {
-			fmt.Fprintf(os.Stderr, "Advertencia: relay no disponible: %v\n", err)
-		} else {
-			fmt.Println("Relay propio activado")
-		}
-	}
+	pickRelayAndEnable(node, relayAddrs)
 
 	if err := node.JoinTopic(topic); err != nil {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
 		return 1
 	}
 
-	if len(payload.Peers) > 0 {
-		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
-		node.SetRoomPeers(payload.Peers)
-		node.ConnectToPeersWithRetry(payload.Peers, 5, 700*time.Millisecond)
+	node.SetRoomTopic(payload.Topic)
+	dialPeers, fromMem := orderPeersPreferStored(payload.Topic, payload.Peers)
+	if fromMem {
+		fmt.Println("Conectando: prioridad al ultimo peer que funciono en esta sala.")
+	}
+	if len(dialPeers) > 0 {
+		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(dialPeers))
+		node.SetRoomPeers(dialPeers)
+		node.ConnectToPeersWithRetry(dialPeers, defaultJoinConnectRetries, defaultJoinConnectRetryDelay)
 		if node.TopicPeerCount() == 0 {
 			fmt.Println("Aviso: no se logro enlace directo con peers. El chat puede no enviar/recibir sin relay o puertos abiertos.")
 			logx.Warn("p2p join sin peers enlazados")
 		}
+		persistPeerPreferenceAfterJoin(node, payload.Topic, dialPeers)
 	}
 
-	_ = node.Publish(name+" se unio", "system")
+	publishSystemEvent(node, name+" se unio")
 	return node.RunChat(code)
 }
 
@@ -159,8 +203,7 @@ func RunCreateGuaranteed(name string) int {
 	}
 
 	fmt.Println("Iniciando nodo P2P (modo guaranteed)...")
-	ctx := context.Background()
-	node, err := NewNodeGuaranteed(ctx, nil)
+	node, err := newNodeWithDefaults(true, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creando nodo: %v\n", err)
 		return 1
@@ -174,9 +217,7 @@ func RunCreateGuaranteed(name string) int {
 
 	// Esperar hasta 30 segundos a que AutoRelay reserve un slot en un relay.
 	// Esto es clave: sin relay address en el codigo, el otro peer no podra conectar.
-	fmt.Print("Esperando direccion relay")
-	gotRelay := node.WaitForRelay(30 * time.Second)
-	fmt.Println()
+	gotRelay := waitForRelayOrWarn(node)
 	if gotRelay {
 		fmt.Println("Relay obtenido exitosamente")
 		logx.Info("guaranteed: relay address obtenida")
@@ -195,6 +236,7 @@ func RunCreateGuaranteed(name string) int {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
 		return 1
 	}
+	node.SetRoomTopic(topic)
 
 	code, err := BuildRoomCodeWithProtocol(topic, "", node.AdvertisePeerAddrs(), "guaranteed")
 	if err != nil {
@@ -202,17 +244,11 @@ func RunCreateGuaranteed(name string) int {
 		return 1
 	}
 
-	_ = saveLastCode(code)
+	persistRoomCode(code)
 
-	fmt.Printf("\nSala creada exitosamente (modo guaranteed)\n")
-	fmt.Printf("Codigo de sala: %s\n", code)
-	clipboard.AnnounceRoomCode(code)
-	fmt.Printf("Peer ID:        %s\n", node.ID())
-	fmt.Println("Comparte el codigo con tus peers")
-	fmt.Println()
 	logx.Info("p2p guaranteed sala creada", "peerID", node.ID())
 
-	_ = node.Publish(name+" creo la sala", "system")
+	publishSystemEvent(node, name+" creo la sala")
 	return node.RunChat(code)
 }
 
@@ -235,8 +271,7 @@ func RunJoinGuaranteed(name, code string) int {
 	}
 
 	fmt.Println("Iniciando nodo P2P (modo guaranteed)...")
-	ctx := context.Background()
-	node, err := NewNodeGuaranteed(ctx, nil)
+	node, err := newNodeWithDefaults(true, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creando nodo: %v\n", err)
 		return 1
@@ -249,9 +284,7 @@ func RunJoinGuaranteed(name, code string) int {
 	node.Bootstrap(nil)
 
 	// Esperar relay para poder ser alcanzado por el otro peer.
-	fmt.Print("Esperando direccion relay")
-	gotRelay := node.WaitForRelay(30 * time.Second)
-	fmt.Println()
+	gotRelay := waitForRelayOrWarn(node)
 	if gotRelay {
 		fmt.Println("Relay obtenido exitosamente")
 		logx.Info("guaranteed join: relay address obtenida")
@@ -265,19 +298,25 @@ func RunJoinGuaranteed(name, code string) int {
 		return 1
 	}
 
-	if len(payload.Peers) > 0 {
-		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
-		node.SetRoomPeers(payload.Peers)
-		node.ConnectToPeersWithRetry(payload.Peers, 8, 1*time.Second)
+	node.SetRoomTopic(payload.Topic)
+	dialPeers, fromMem := orderPeersPreferStored(payload.Topic, payload.Peers)
+	if fromMem {
+		fmt.Println("Conectando: prioridad al ultimo peer que funciono en esta sala.")
+	}
+	if len(dialPeers) > 0 {
+		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(dialPeers))
+		node.SetRoomPeers(dialPeers)
+		node.ConnectToPeersWithRetry(dialPeers, guaranteedJoinConnectRetries, guaranteedJoinConnectRetryDelay)
 		if node.TopicPeerCount() == 0 {
 			fmt.Println("Aviso: sin enlace aun. El relay negociara la conexion en segundo plano...")
 			logx.Warn("guaranteed join sin peers directos tras reintentos")
 		} else {
 			fmt.Printf("Enlazado con %d peer(s)\n", node.TopicPeerCount())
 		}
+		persistPeerPreferenceAfterJoin(node, payload.Topic, dialPeers)
 	}
 
-	_ = node.Publish(name+" se unio", "system")
+	publishSystemEvent(node, name+" se unio")
 	return node.RunChat(code)
 }
 

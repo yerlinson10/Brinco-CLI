@@ -11,12 +11,14 @@ import (
 // van cifrados (nonce/cipher) y deben descifrarse y mostrarse en el otro peer; los
 // system siguen en JSON en claro y deben mostrarse sin pasar por AES-GCM.
 func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
-	t.Parallel()
+	cacheDir := newIsolatedCacheDir(t)
+	clearCachedRoomCodeFile(t, cacheDir, e2eP2PLastCodeFile)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	createCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "create", "--mode", "p2p", "--name", "host")
 	createCmd.Dir = repoRoot(t)
+	withIsolatedCacheEnv(createCmd, cacheDir)
 	var hostOut safeOutput
 	createCmd.Stdout = &hostOut
 	createCmd.Stderr = &hostOut
@@ -28,14 +30,14 @@ func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
-	code := extractCode(hostOut.String())
+	code := waitHostThenReadCachedRoomCode(t, ctx, &hostOut, cacheDir, e2eP2PLastCodeFile)
 	if code == "" {
 		t.Fatalf("no se pudo extraer code p2p: %s", hostOut.String())
 	}
 
 	joinCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "join", "--mode", "p2p", "--code", code, "--name", "guest")
 	joinCmd.Dir = repoRoot(t)
+	withIsolatedCacheEnv(joinCmd, cacheDir)
 	var guestOut safeOutput
 	joinCmd.Stdout = &guestOut
 	joinCmd.Stderr = &guestOut

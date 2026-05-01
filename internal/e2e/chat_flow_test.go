@@ -13,12 +13,15 @@ import (
 )
 
 func TestDirectCreateJoinSendLeave(t *testing.T) {
-	t.Parallel()
+	lockSharedChatRoomCodeCache(t)
+	cacheDir := newIsolatedCacheDir(t)
+	clearCachedRoomCodeFile(t, cacheDir, e2eChatLastRoomCodeFile)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	createCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "create", "--mode", "direct", "--listen", "127.0.0.1:19091", "--public", "127.0.0.1:19091", "--password", "p4ss", "--name", "host")
 	createCmd.Dir = repoRoot(t)
+	withIsolatedCacheEnv(createCmd, cacheDir)
 	var hostOut safeOutput
 	createCmd.Stdout = &hostOut
 	createCmd.Stderr = &hostOut
@@ -30,14 +33,14 @@ func TestDirectCreateJoinSendLeave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
-	code := extractCode(hostOut.String())
+	code := waitHostThenReadCachedRoomCode(t, ctx, &hostOut, cacheDir, e2eChatLastRoomCodeFile)
 	if code == "" {
 		t.Fatalf("no se pudo extraer code: %s", hostOut.String())
 	}
 
 	joinCmd := exec.CommandContext(ctx, "go", "run", "./cmd/brinco", "room", "join", "--mode", "direct", "--code", code, "--password", "p4ss", "--name", "guest")
 	joinCmd.Dir = repoRoot(t)
+	withIsolatedCacheEnv(joinCmd, cacheDir)
 	var guestOut safeOutput
 	joinCmd.Stdout = &guestOut
 	joinCmd.Stderr = &guestOut
