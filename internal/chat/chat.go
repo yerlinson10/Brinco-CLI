@@ -632,9 +632,16 @@ func (s *roomServer) removeClient(c *serverClient) {
 
 func (s *roomServer) broadcast(msg wireMessage, except *serverClient) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	targets := make([]*serverClient, 0, len(s.clients))
 	for c := range s.clients {
-		if c == except {
+		if c != except {
+			targets = append(targets, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range targets {
+		if msg.Type == msgTypeFileChunk {
+			enqueueClientWireBlocking(c, msg)
 			continue
 		}
 		enqueueClientWire(c, msg, "broadcast")

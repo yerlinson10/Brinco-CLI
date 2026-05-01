@@ -39,6 +39,32 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+const p2pFileChunkSize = 64 * 1024
+
+// p2pPubSubBufferSlots dimensiona colas gossipsub: el default (32) hace que
+// notifySubs descarte mensajes si llegan muchos file_chunk seguidos antes de
+// que receiveLoop vacie la suscripcion (archivos ~>8MB).
+func p2pPubSubBufferSlots() int {
+	n := int((maxP2PFileBytes+p2pFileChunkSize-1)/p2pFileChunkSize) + 128
+	if n < 256 {
+		return 256
+	}
+	if n > 4096 {
+		return 4096
+	}
+	return n
+}
+
+func gossipSubOpts() []pubsub.Option {
+	buf := p2pPubSubBufferSlots()
+	return []pubsub.Option{
+		pubsub.WithPeerExchange(true),
+		pubsub.WithFloodPublish(true),
+		pubsub.WithValidateQueueSize(buf),
+		pubsub.WithPeerOutboundQueueSize(buf),
+	}
+}
+
 // Bootstrap nodes de la red IPFS/libp2p - publicos y gratuitos
 var defaultBootstrapPeers = []string{
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -228,12 +254,7 @@ func NewNodeGuaranteed(ctx context.Context, extraRelayAddrs []string) (*Node, er
 		return nil, fmt.Errorf("error bootstrap DHT: %w", err)
 	}
 
-	ps, err := pubsub.NewGossipSub(
-		retx,
-		h,
-		pubsub.WithPeerExchange(true),
-		pubsub.WithFloodPublish(true),
-	)
+	ps, err := pubsub.NewGossipSub(retx, h, gossipSubOpts()...)
 	if err != nil {
 		_ = h.Close()
 		cancel()
@@ -290,12 +311,7 @@ func NewNode(ctx context.Context, relayAddrs []string) (*Node, error) {
 		return nil, fmt.Errorf("error creando nodo: %w", err)
 	}
 
-	ps, err := pubsub.NewGossipSub(
-		ctx,
-		h,
-		pubsub.WithPeerExchange(true),
-		pubsub.WithFloodPublish(true),
-	)
+	ps, err := pubsub.NewGossipSub(ctx, h, gossipSubOpts()...)
 	if err != nil {
 		_ = h.Close()
 		cancel()
@@ -398,7 +414,7 @@ func (n *Node) JoinTopic(topic string) error {
 	if err != nil {
 		return err
 	}
-	sub, err := t.Subscribe()
+	sub, err := t.Subscribe(pubsub.WithBufferSize(p2pPubSubBufferSlots()))
 	if err != nil {
 		return err
 	}
@@ -1328,17 +1344,16 @@ func (n *Node) sendFile(path string) error {
 	if idx := strings.LastIndexAny(path, "/\\"); idx >= 0 {
 		name = path[idx+1:]
 	}
-	const chunkSize = 64 * 1024
 	sum := sha256.Sum256(raw)
 	checksum := hex.EncodeToString(sum[:])
 	transferID := checksum[:16]
-	chunkCount := int((int64(len(raw)) + chunkSize - 1) / chunkSize)
+	chunkCount := int((int64(len(raw)) + p2pFileChunkSize - 1) / p2pFileChunkSize)
 	if chunkCount == 0 {
 		chunkCount = 1
 	}
 	for i := 0; i < chunkCount; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
+		start := i * p2pFileChunkSize
+		end := start + p2pFileChunkSize
 		if end > len(raw) {
 			end = len(raw)
 		}
@@ -1356,7 +1371,7 @@ func (n *Node) sendFile(path string) error {
 			TransferID:  transferID,
 			ChunkIndex:  i,
 			ChunkCount:  chunkCount,
-			ChunkSize:   chunkSize,
+			ChunkSize:   p2pFileChunkSize,
 			TotalSize:   int64(len(raw)),
 			Checksum:    checksum,
 			Fingerprint: n.fingerprint(n.host.ID().String()),

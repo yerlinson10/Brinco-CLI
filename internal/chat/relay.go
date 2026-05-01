@@ -476,9 +476,16 @@ func (r *relayRoom) uniqueName(base string) string {
 
 func (r *relayRoom) broadcast(msg wireMessage, except *serverClient) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	targets := make([]*serverClient, 0, len(r.clients))
 	for c := range r.clients {
-		if c == except {
+		if c != except {
+			targets = append(targets, c)
+		}
+	}
+	r.mu.Unlock()
+	for _, c := range targets {
+		if msg.Type == msgTypeFileChunk {
+			enqueueClientWireBlocking(c, msg)
 			continue
 		}
 		enqueueClientWire(c, msg, "broadcast")

@@ -97,6 +97,10 @@ func enqueueClientWire(c *serverClient, msg wireMessage, context string) bool {
 	}
 }
 
+func enqueueClientWireBlocking(c *serverClient, msg wireMessage) {
+	c.send <- msg
+}
+
 func acceptShouldStop(err error) bool {
 	return err != nil && errors.Is(err, net.ErrClosed)
 }
