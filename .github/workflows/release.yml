@@ -44,8 +44,8 @@ jobs:
             echo "MINISIGN_SECRET_KEY no esta configurado en secretos." >&2
             exit 1
           fi
-          # Debe ser una clave privada SIN passphrase (compatible con minisign -S -W en CI).
-          # Quitar cifrado localmente: minisign -C -W -s tu.key (ver minisign --help).
+          # Debe ser el contenido del fichero de clave secreta SIN passphrase (minisign -C -W -s tu.key).
+          # minisign -S pide contrasena si la clave esta cifrada; el flag -W no aplica al modo firma.
           keyfile="$RUNNER_TEMP/minisign.key"
           printf '%s\n' "${{ secrets.MINISIGN_SECRET_KEY }}" > "$keyfile"
           chmod 600 "$keyfile"
