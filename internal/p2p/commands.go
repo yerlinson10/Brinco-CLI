@@ -36,6 +36,18 @@ func publishSystemEvent(node *Node, message string) {
 	logNonFatal("no se pudo publicar mensaje de sistema", node.Publish(message, "system"))
 }
 
+func persistPeerPreferenceAfterJoin(node *Node, topic string, dialList []string) {
+	topic = strings.TrimSpace(topic)
+	if topic == "" || len(dialList) == 0 {
+		return
+	}
+	addr := node.PickWorkingPeerAddrFromCandidates(dialList)
+	if addr == "" {
+		return
+	}
+	logNonFatal("no se pudo persistir preferencia de peer", saveLastWorkingPeer(topic, addr))
+}
+
 func newNodeWithDefaults(guaranteed bool, relayAddrs []string) (*Node, error) {
 	ctx := context.Background()
 	nodeFactory := NewNode
@@ -100,6 +112,7 @@ func RunCreate(name, relayAddr string) int {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
 		return 1
 	}
+	node.SetRoomTopic(topic)
 
 	code, err := BuildRoomCode(topic, strings.Join(relayAddrs, ","), node.AdvertisePeerAddrs())
 	if err != nil {
@@ -168,14 +181,20 @@ func RunJoin(name, code, relayAddr string) int {
 		return 1
 	}
 
-	if len(payload.Peers) > 0 {
-		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
-		node.SetRoomPeers(payload.Peers)
-		node.ConnectToPeersWithRetry(payload.Peers, defaultJoinConnectRetries, defaultJoinConnectRetryDelay)
+	node.SetRoomTopic(payload.Topic)
+	dialPeers, fromMem := orderPeersPreferStored(payload.Topic, payload.Peers)
+	if fromMem {
+		fmt.Println("Conectando: prioridad al ultimo peer que funciono en esta sala.")
+	}
+	if len(dialPeers) > 0 {
+		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(dialPeers))
+		node.SetRoomPeers(dialPeers)
+		node.ConnectToPeersWithRetry(dialPeers, defaultJoinConnectRetries, defaultJoinConnectRetryDelay)
 		if node.TopicPeerCount() == 0 {
 			fmt.Println("Aviso: no se logro enlace directo con peers. El chat puede no enviar/recibir sin relay o puertos abiertos.")
 			logx.Warn("p2p join sin peers enlazados")
 		}
+		persistPeerPreferenceAfterJoin(node, payload.Topic, dialPeers)
 	}
 
 	publishSystemEvent(node, name+" se unio")
@@ -224,6 +243,7 @@ func RunCreateGuaranteed(name string) int {
 		fmt.Fprintf(os.Stderr, "Error uniendose al topic: %v\n", err)
 		return 1
 	}
+	node.SetRoomTopic(topic)
 
 	code, err := BuildRoomCodeWithProtocol(topic, "", node.AdvertisePeerAddrs(), "guaranteed")
 	if err != nil {
@@ -291,16 +311,22 @@ func RunJoinGuaranteed(name, code string) int {
 		return 1
 	}
 
-	if len(payload.Peers) > 0 {
-		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(payload.Peers))
-		node.SetRoomPeers(payload.Peers)
-		node.ConnectToPeersWithRetry(payload.Peers, guaranteedJoinConnectRetries, guaranteedJoinConnectRetryDelay)
+	node.SetRoomTopic(payload.Topic)
+	dialPeers, fromMem := orderPeersPreferStored(payload.Topic, payload.Peers)
+	if fromMem {
+		fmt.Println("Conectando: prioridad al ultimo peer que funciono en esta sala.")
+	}
+	if len(dialPeers) > 0 {
+		fmt.Printf("Intentando enlazar con %d peer(s) de la sala...\n", len(dialPeers))
+		node.SetRoomPeers(dialPeers)
+		node.ConnectToPeersWithRetry(dialPeers, guaranteedJoinConnectRetries, guaranteedJoinConnectRetryDelay)
 		if node.TopicPeerCount() == 0 {
 			fmt.Println("Aviso: sin enlace aun. El relay negociara la conexion en segundo plano...")
 			logx.Warn("guaranteed join sin peers directos tras reintentos")
 		} else {
 			fmt.Printf("Enlazado con %d peer(s)\n", node.TopicPeerCount())
 		}
+		persistPeerPreferenceAfterJoin(node, payload.Topic, dialPeers)
 	}
 
 	publishSystemEvent(node, name+" se unio")

@@ -29,6 +29,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
@@ -95,6 +96,7 @@ type Node struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	roomPeers []string
+	roomTopic string // topic brinco-... de la sala (para persistir preferencia de dial)
 
 	seenMu   sync.Mutex
 	seenMsgs map[string]time.Time
@@ -444,6 +446,11 @@ func (n *Node) SetRoomPeers(peers []string) {
 	n.roomPeers = append([]string(nil), peers...)
 }
 
+// SetRoomTopic fija el identificador de sala (topic) para memoria de dial local.
+func (n *Node) SetRoomTopic(topic string) {
+	n.roomTopic = strings.TrimSpace(topic)
+}
+
 func (n *Node) SetRoomCode(code string) {
 	n.roomCode = strings.TrimSpace(code)
 	n.roomSecret = sha256.Sum256([]byte(n.roomCode))
@@ -520,6 +527,59 @@ func (n *Node) AdvertisePeerAddrs() []string {
 		peers = append(peers, full.String())
 	}
 	return peers
+}
+
+// PickWorkingPeerAddrFromCandidates devuelve el multiaddr del primer candidato
+// cuya identidad aparece en la malla del topic o tiene conexion libp2p activa.
+func (n *Node) PickWorkingPeerAddrFromCandidates(candidates []string) string {
+	self := n.host.ID()
+	meshSet := make(map[peer.ID]struct{})
+	if n.topic != nil && n.ps != nil {
+		for _, p := range n.ps.ListPeers(n.topic.String()) {
+			if p == self {
+				continue
+			}
+			meshSet[p] = struct{}{}
+		}
+	}
+	for _, addr := range candidates {
+		s := strings.TrimSpace(addr)
+		if s == "" {
+			continue
+		}
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pi, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			continue
+		}
+		if pi.ID == self {
+			continue
+		}
+		if _, ok := meshSet[pi.ID]; ok {
+			return s
+		}
+	}
+	for _, addr := range candidates {
+		s := strings.TrimSpace(addr)
+		if s == "" {
+			continue
+		}
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pi, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil || pi.ID == self {
+			continue
+		}
+		if n.host.Network().Connectedness(pi.ID) == network.Connected {
+			return s
+		}
+	}
+	return ""
 }
 
 // ConnectToPeers intenta conectar a una lista de multiaddrs de peers.
@@ -1520,6 +1580,24 @@ func (n *Node) bindPeerIdentity(peerID, alias string) bool {
 	if peerID == "" {
 		return false
 	}
+
+	n.statusMu.Lock()
+	if prevAlias, ok := n.peerNameByID[peerID]; ok && alias != "" && prevAlias != alias {
+		n.statusMu.Unlock()
+		return false
+	}
+	var staleHolder string
+	if alias != "" {
+		if prevID, ok := n.peerIDByName[alias]; ok && prevID != peerID {
+			staleHolder = prevID
+		}
+	}
+	n.statusMu.Unlock()
+
+	if staleHolder != "" && n.peerIdentityActive(staleHolder) {
+		return false
+	}
+
 	n.statusMu.Lock()
 	defer n.statusMu.Unlock()
 	if prevAlias, ok := n.peerNameByID[peerID]; ok && alias != "" && prevAlias != alias {
@@ -1527,12 +1605,57 @@ func (n *Node) bindPeerIdentity(peerID, alias string) bool {
 	}
 	if alias != "" {
 		if prevID, ok := n.peerIDByName[alias]; ok && prevID != peerID {
-			return false
+			if n.peerIdentityActive(prevID) {
+				return false
+			}
+			n.unbindPeerLocked(prevID)
 		}
 		n.peerIDByName[alias] = peerID
 		n.peerNameByID[peerID] = alias
 	}
 	return true
+}
+
+// peerIdentityActive indica si el peer sigue presente en la malla del topic
+// o con conexion libp2p activa. Si no, otro cliente puede reclamar el mismo
+// alias (reconexion tras cerrar la consola sin suplantacion real).
+func (n *Node) peerIdentityActive(peerIDStr string) bool {
+	peerIDStr = strings.TrimSpace(peerIDStr)
+	if peerIDStr == "" {
+		return false
+	}
+	pid, err := peer.Decode(peerIDStr)
+	if err != nil {
+		return false
+	}
+	if n.host.Network().Connectedness(pid) == network.Connected {
+		return true
+	}
+	if n.topic != nil && n.ps != nil {
+		topic := n.topic.String()
+		for _, p := range n.ps.ListPeers(topic) {
+			if p == pid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (n *Node) unbindPeerLocked(peerID string) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return
+	}
+	if alias, ok := n.peerNameByID[peerID]; ok && alias != "" {
+		if n.peerIDByName[alias] == peerID {
+			delete(n.peerIDByName, alias)
+		}
+	}
+	delete(n.peerNameByID, peerID)
+	delete(n.peerFingerprints, peerID)
+	delete(n.peerPubByID, peerID)
+	delete(n.rate, peerID)
 }
 
 func (n *Node) trackPeerPubKey(peerID, pubKey string) {

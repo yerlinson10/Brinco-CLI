@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,53 @@ func setCacheEnv(t *testing.T, dir string) {
 	t.Setenv("LOCALAPPDATA", dir)
 	t.Setenv("APPDATA", dir)
 	t.Setenv("HOME", dir)
+}
+
+func TestSaveAndLoadLastWorkingPeer(t *testing.T) {
+	setCacheEnv(t, t.TempDir())
+	topic := "brinco-roomtest"
+	addr := "/ip4/1.2.3.4/tcp/4001/p2p/QmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if err := saveLastWorkingPeer(topic, addr); err != nil {
+		t.Fatalf("saveLastWorkingPeer: %v", err)
+	}
+	got, ok := loadLastWorkingPeer(topic)
+	if !ok || got != addr {
+		t.Fatalf("loadLastWorkingPeer = %q ok=%v want %q", got, ok, addr)
+	}
+}
+
+func TestOrderPeersPreferStored(t *testing.T) {
+	setCacheEnv(t, t.TempDir())
+	topic := "brinco-xyz"
+	stored := "/dns4/relay.example/tcp/443/p2p/QmBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	codePeers := []string{
+		"/ip4/10.0.0.1/tcp/4001/p2p/QmCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+	}
+	if err := saveLastWorkingPeer(topic, stored); err != nil {
+		t.Fatal(err)
+	}
+	out, used := orderPeersPreferStored(topic, codePeers)
+	if !used {
+		t.Fatal("expected usedStored true")
+	}
+	if len(out) != 2 || out[0] != stored {
+		t.Fatalf("got %#v", out)
+	}
+	if out[1] != codePeers[0] {
+		t.Fatalf("second peer: %q", out[1])
+	}
+}
+
+func TestOrderPeersPreferStoredDedup(t *testing.T) {
+	setCacheEnv(t, t.TempDir())
+	topic := "brinco-dedup"
+	same := "/ip4/9.9.9.9/tcp/1/p2p/QmDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+	if err := saveLastWorkingPeer(topic, "  "+same+"  "); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := orderPeersPreferStored(topic, []string{same, "/other"})
+	if len(out) != 2 || out[0] != strings.TrimSpace(same) {
+		t.Fatalf("got %#v", out)
+	}
 }
 
