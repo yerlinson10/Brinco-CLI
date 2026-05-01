@@ -36,27 +36,6 @@ archives:
 checksum:
   name_template: checksums.txt
 
-signs:
-  - id: checksums_minisign
-    artifacts: checksum
-    cmd: minisign
-    signature: "${artifact}.minisig"
-    args:
-      - -S
-      # CI sin TTY: el fichero de clave secreta debe estar SIN cifrado (KDF none). Si la clave tiene
-      # passphrase, minisign llama a get_password() y falla. Generar sin pass: minisign -G -W; quitar
-      # pass de una existente: minisign -C -W -s tu.key. El flag -W en -S no evita el prompt; solo
-      # afecta a -G/-C (ver minisign.c).
-      - -W
-      - -s
-      - "{{ .Env.MINISIGN_SECRET_KEY_FILE }}"
-      - -m
-      - "${artifact}"
-      - -x
-      - "${signature}"
-      - -t
-      - "Brinco checksums signature"
-
 release:
   github:
     owner: yerlinson10

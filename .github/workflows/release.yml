@@ -24,33 +24,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install minisign
-        run: |
-          set -euo pipefail
-          VER=0.12
-          curl -fsSL "https://github.com/jedisct1/minisign/releases/download/${VER}/minisign-${VER}-linux.tar.gz" -o /tmp/minisign.tgz
-          mkdir -p /tmp/minisign-extract
-          tar xzf /tmp/minisign.tgz -C /tmp/minisign-extract
-          BIN="$(find /tmp/minisign-extract -type f -name minisign | head -1)"
-          test -n "$BIN"
-          sudo install -m755 "$BIN" /usr/local/bin/minisign
-          minisign -V
-
-      - name: Prepare minisign private key
-        if: github.event_name == 'release'
-        shell: bash
-        run: |
-          if [ -z "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then
-            echo "MINISIGN_SECRET_KEY no esta configurado en secretos." >&2
-            exit 1
-          fi
-          # Debe ser el contenido del fichero de clave secreta SIN passphrase (minisign -C -W -s tu.key).
-          # minisign -S pide contrasena si la clave esta cifrada; el flag -W no aplica al modo firma.
-          keyfile="$RUNNER_TEMP/minisign.key"
-          printf '%s\n' "${{ secrets.MINISIGN_SECRET_KEY }}" > "$keyfile"
-          chmod 600 "$keyfile"
-          echo "MINISIGN_SECRET_KEY_FILE=$keyfile" >> "$GITHUB_ENV"
-
       - name: Run GoReleaser
         if: github.event_name == 'release'
         uses: goreleaser/goreleaser-action@v6
@@ -62,7 +35,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-          MINISIGN_SECRET_KEY_FILE: ${{ env.MINISIGN_SECRET_KEY_FILE }}
 
       - name: Run GoReleaser snapshot (manual)
         if: github.event_name != 'release'
@@ -70,7 +42,7 @@ jobs:
         with:
           distribution: goreleaser
           version: ~> v2
-          args: release --clean --snapshot --skip=signs
+          args: release --clean --snapshot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
