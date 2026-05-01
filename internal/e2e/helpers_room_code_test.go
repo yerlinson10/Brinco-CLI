@@ -3,7 +3,9 @@ package e2e
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,18 +22,66 @@ func lockSharedChatRoomCodeCache(t *testing.T) {
 	t.Cleanup(chatRoomCodeCacheSerial.Unlock)
 }
 
-// clearSharedChatRoomCodeCacheFile borra el ultimo codigo chat (direct/relay).
-// Sin esto, waitHostThenReadCachedRoomCode puede leer el codigo del test anterior
-// (p. ej. direct en 127.0.0.1:19091) en cuanto aparece la TUI, antes de que el
-// host actual escriba el archivo.
-func clearSharedChatRoomCodeCacheFile(t *testing.T) {
+func newIsolatedCacheDir(t *testing.T) string {
 	t.Helper()
+	root, err := os.MkdirTemp("", "brinco-e2e-cache-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(root)
+	})
+	dir := filepath.Join(root, "cache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func withIsolatedCacheEnv(cmd *exec.Cmd, cacheDir string) {
+	env := append([]string{}, os.Environ()...)
+	originalLocalAppData := os.Getenv("LOCALAPPDATA")
+	env = upsertEnv(env, "XDG_CACHE_HOME", cacheDir)
+	env = upsertEnv(env, "LOCALAPPDATA", cacheDir)
+	env = upsertEnv(env, "APPDATA", cacheDir)
+	if goCache := os.Getenv("GOCACHE"); goCache != "" {
+		env = upsertEnv(env, "GOCACHE", goCache)
+	} else if originalLocalAppData != "" {
+		env = upsertEnv(env, "GOCACHE", filepath.Join(originalLocalAppData, "go-build"))
+	}
+	if goEnv := os.Getenv("GOENV"); goEnv != "" {
+		env = upsertEnv(env, "GOENV", goEnv)
+	}
+	cmd.Env = env
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i := range env {
+		if strings.HasPrefix(strings.ToUpper(env[i]), strings.ToUpper(prefix)) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func clearCachedRoomCodeFile(t *testing.T, cacheDir, cacheFile string) {
+	t.Helper()
+	path := filepath.Join(cacheDir, cacheFile)
+	_ = os.Remove(path)
+}
+
+func resolveCacheDir(t *testing.T, cacheDir string) string {
+	t.Helper()
+	if cacheDir != "" {
+		return cacheDir
+	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, e2eChatLastRoomCodeFile)
-	_ = os.Remove(path)
+	return dir
 }
 
 const (
@@ -42,14 +92,10 @@ const (
 
 // waitHostThenReadCachedRoomCode espera a que arranque la TUI y lee el codigo
 // guardado en disco (el host ya no imprime el codigo en stdout).
-func waitHostThenReadCachedRoomCode(t *testing.T, ctx context.Context, out *safeOutput, cacheFile string) string {
+func waitHostThenReadCachedRoomCode(t *testing.T, ctx context.Context, out *safeOutput, cacheDir, cacheFile string) string {
 	t.Helper()
 	waitForCtx(t, ctx, out, e2eTUIReadyMarker)
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(cacheDir, cacheFile)
+	path := filepath.Join(resolveCacheDir(t, cacheDir), cacheFile)
 	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {

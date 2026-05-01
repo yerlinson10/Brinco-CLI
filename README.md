@@ -407,7 +407,7 @@ El codigo de sala sigue el formato `PROTOCOLO-BASE64_JSON` con el payload segun 
 
 ### `go` no se reconoce
 
-Instala Go 1.22+ desde [go.dev/dl](https://go.dev/dl/) y reinicia la terminal (`go version`).
+Instala Go 1.25.7+ desde [go.dev/dl](https://go.dev/dl/) y reinicia la terminal (`go version`).
 
 ### Error al parsear el codigo
 
