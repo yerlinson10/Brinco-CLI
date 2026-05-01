@@ -120,6 +120,7 @@ brinco version
 | Canal | Notas |
 |-------|--------|
 | **Scoop (Windows)** | `scoop bucket add brinco-bucket https://github.com/yerlinson10/scoop-bucket` → `scoop install brinco` |
+| **Homebrew (macOS / Linux)** | Repo tap: [homebrew-tap](https://github.com/yerlinson10/homebrew-tap). Tras publicar un release con CI: `brew tap yerlinson10/tap` → `brew install brinco` |
 | **.deb / .rpm** | Descarga desde Releases; `dpkg -i` / `rpm -i` |
 | **Instalador .exe** | Releases → setup; opcional “Add Brinco to PATH” |
 
