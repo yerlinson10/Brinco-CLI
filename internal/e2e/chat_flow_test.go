@@ -13,6 +13,7 @@ import (
 )
 
 func TestDirectCreateJoinSendLeave(t *testing.T) {
+	lockSharedChatRoomCodeCache(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 

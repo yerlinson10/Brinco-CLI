@@ -4,9 +4,21 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+// chatRoomCodeCacheSerial evita carreras: direct y relay guardan el ultimo codigo
+// en el mismo archivo bajo UserCacheDir (brinco-last-room-code.txt). Sin esto,
+// go test puede ejecutar ambos tests en paralelo y el join lee un codigo ajeno.
+var chatRoomCodeCacheSerial sync.Mutex
+
+func lockSharedChatRoomCodeCache(t *testing.T) {
+	t.Helper()
+	chatRoomCodeCacheSerial.Lock()
+	t.Cleanup(chatRoomCodeCacheSerial.Unlock)
+}
 
 const (
 	e2eChatLastRoomCodeFile = "brinco-last-room-code.txt"
