@@ -675,6 +675,11 @@ func (n *Node) RunChat(roomCode string) int {
 	}
 	app.PushLine("Escribe mensajes y Enter para enviar")
 	app.PushLine("Comandos: /code /peers /diag /clear /history !! @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	if strings.TrimSpace(roomCode) != "" {
+		for _, ln := range clipboard.RoomCodeFeedbackLines(roomCode) {
+			app.PushLine(ln)
+		}
+	}
 
 	localLimiter := &peerRate{tokens: 3, last: time.Now()}
 	history := make([]string, 0, 50)

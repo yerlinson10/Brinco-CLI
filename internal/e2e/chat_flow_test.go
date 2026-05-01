@@ -13,7 +13,6 @@ import (
 )
 
 func TestDirectCreateJoinSendLeave(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -30,8 +29,7 @@ func TestDirectCreateJoinSendLeave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
-	code := extractCode(hostOut.String())
+	code := waitHostThenReadCachedRoomCode(t, ctx, &hostOut, e2eChatLastRoomCodeFile)
 	if code == "" {
 		t.Fatalf("no se pudo extraer code: %s", hostOut.String())
 	}

@@ -86,10 +86,3 @@ func RoomCodeFeedbackLines(code string) []string {
 	out = append(out, "Codigo copiado al portapapeles.")
 	return out
 }
-
-// AnnounceRoomCode copia code al portapapeles e informa en consola.
-func AnnounceRoomCode(code string) {
-	for _, ln := range RoomCodeFeedbackLines(code) {
-		fmt.Println(ln)
-	}
-}

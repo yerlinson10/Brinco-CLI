@@ -11,7 +11,6 @@ import (
 // van cifrados (nonce/cipher) y deben descifrarse y mostrarse en el otro peer; los
 // system siguen en JSON en claro y deben mostrarse sin pasar por AES-GCM.
 func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -28,8 +27,7 @@ func TestP2PCreateJoinEncryptedChatAndSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForCtx(t, ctx, &hostOut, "Codigo de sala:")
-	code := extractCode(hostOut.String())
+	code := waitHostThenReadCachedRoomCode(t, ctx, &hostOut, e2eP2PLastCodeFile)
 	if code == "" {
 		t.Fatalf("no se pudo extraer code p2p: %s", hostOut.String())
 	}

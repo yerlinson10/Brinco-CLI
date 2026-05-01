@@ -214,10 +214,6 @@ func RunCreate(name, listenAddr, publicAddr, password string) int {
 
 	_ = SaveLastRoomCode(code)
 
-	fmt.Println("Sala creada")
-	fmt.Printf("Codigo de sala: %s\n", code)
-	clipboard.AnnounceRoomCode(code)
-	fmt.Println("Comparte este codigo con tus peers")
 	logx.Info("chat sala creada", "mode", roomModeDirect, "room", roomID)
 
 	dialAddr := dialAddrForHost(listenAddr)
@@ -812,6 +808,9 @@ func runClient(addr, roomID, name, password, roomCode string) int {
 	}
 	app.PushLine("Escribe mensajes y Enter para enviar")
 	app.PushLine("Comandos: /code /peers /diag /clear /history !! /kick|/mute|/unmute|/ban @usuario mensaje | /msg u texto | /send archivo /quit /help")
+	if strings.TrimSpace(roomCode) != "" {
+		pushRoomCodeAnnouncement(app, roomCode)
+	}
 
 	done := make(chan struct{})
 	errCh := make(chan error, 1)

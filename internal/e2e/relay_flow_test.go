@@ -9,7 +9,6 @@ import (
 )
 
 func TestRelayCreateJoinLeave(t *testing.T) {
-	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	relayAddr := freeLocalAddr(t)
@@ -33,8 +32,7 @@ func TestRelayCreateJoinLeave(t *testing.T) {
 	if err := create.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitForCtx(t, ctx, &hostOut, "Codigo:")
-	code := extractCode(hostOut.String())
+	code := waitHostThenReadCachedRoomCode(t, ctx, &hostOut, e2eChatLastRoomCodeFile)
 	if code == "" {
 		t.Fatalf("sin code relay: %s", hostOut.String())
 	}
